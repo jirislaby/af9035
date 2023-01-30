@@ -8,6 +8,7 @@
 #include <linux/usb.h>
 
 #include <media/v4l2-device.h>
+#include <media/v4l2-ioctl.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
@@ -21,6 +22,7 @@ struct af9035 {
 	struct vb2_queue vb2q;
 
 	struct mutex vb2q_lock;
+	struct mutex v4l2_lock;
 
 	/* List of videobuf2 buffers protected by a lock. */
 	spinlock_t buflock;
@@ -118,6 +120,38 @@ static void af9035_release(struct v4l2_device *v4l2_dev)
 	dev_info(v4l2_dev->dev, "FREE\n");
 }
 
+static const struct v4l2_file_operations af9035_fops = {
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = video_ioctl2,
+	.mmap = vb2_fop_mmap,
+	.open = v4l2_fh_open,
+	.release = vb2_fop_release,
+	.read = vb2_fop_read,
+	.poll = vb2_fop_poll,
+};
+
+static const struct v4l2_ioctl_ops af9035_ioctl_ops = {
+//	.vidioc_querycap = af9035_querycap,
+//	.vidioc_enum_input = af9035_enum_input,
+//	.vidioc_enum_fmt_vid_cap = af9035_enum_fmt_vid_cap,
+//	.vidioc_g_fmt_vid_cap = af9035_fmt_vid_cap,
+//	.vidioc_try_fmt_vid_cap = af9035_fmt_vid_cap,
+//	.vidioc_s_fmt_vid_cap = af9035_fmt_vid_cap,
+//	.vidioc_g_std = af9035_g_std,
+//	.vidioc_s_std = af9035_s_std,
+//	.vidioc_g_input = af9035_g_input,
+//	.vidioc_s_input = af9035_s_input,
+
+	.vidioc_reqbufs = vb2_ioctl_reqbufs,
+	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
+	.vidioc_querybuf = vb2_ioctl_querybuf,
+	.vidioc_create_bufs = vb2_ioctl_create_bufs,
+	.vidioc_qbuf = vb2_ioctl_qbuf,
+	.vidioc_dqbuf = vb2_ioctl_dqbuf,
+	.vidioc_streamon = vb2_ioctl_streamon,
+	.vidioc_streamoff = vb2_ioctl_streamoff,
+};
+
 static int af9035_probe(struct usb_interface *intf,
 			const struct usb_device_id *id)
 {
@@ -132,6 +166,7 @@ static int af9035_probe(struct usb_interface *intf,
 		return -ENOMEM;
 
 	mutex_init(&af9035->vb2q_lock);
+	mutex_init(&af9035->v4l2_lock);
 	spin_lock_init(&af9035->buflock);
 
 	af9035->udev = usb_get_dev(interface_to_usbdev(intf));
@@ -148,21 +183,41 @@ static int af9035_probe(struct usb_interface *intf,
 	ret = vb2_queue_init(&af9035->vb2q);
 	if (ret < 0) {
 		dev_err(&intf->dev, "Could not initialize videobuf2 queue\n");
-		goto free;
+		goto err_free;
 	}
 
 	af9035->v4l2_dev.release = af9035_release;
 	ret = v4l2_device_register(&intf->dev, &af9035->v4l2_dev);
 	if (ret < 0) {
 		dev_err(&intf->dev, "Could not register v4l2 device\n");
-		goto free;
+		goto err_free;
+	}
+
+	/* Video structure */
+	strscpy(af9035->vdev.name, "af9035", sizeof(af9035->vdev.name));
+	af9035->vdev.v4l2_dev = &af9035->v4l2_dev;
+	af9035->vdev.release = video_device_release_empty;
+	af9035->vdev.fops = &af9035_fops;
+	af9035->vdev.ioctl_ops = &af9035_ioctl_ops;
+	af9035->vdev.tvnorms = V4L2_STD_PAL_D;
+	af9035->vdev.queue = &af9035->vb2q;
+	af9035->vdev.lock = &af9035->v4l2_lock;
+	af9035->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
+		V4L2_CAP_STREAMING;
+	video_set_drvdata(&af9035->vdev, af9035);
+	ret = video_register_device(&af9035->vdev, VFL_TYPE_VIDEO, -1);
+	if (ret < 0) {
+		dev_warn(&intf->dev, "Could not register video device\n");
+		goto err_v4l2;
 	}
 
 	usb_set_intfdata(intf, af9035);
 	v4l2_device_get(&af9035->v4l2_dev);
 
 	return 0;
-free:
+err_v4l2:
+	v4l2_device_unregister(&af9035->v4l2_dev);
+err_free:
 	usb_put_dev(af9035->udev);
 	kfree(af9035);
 	return ret;
@@ -174,7 +229,7 @@ static void af9035_disconnect(struct usb_interface *intf)
 
 	dev_info(&intf->dev, "%zu\n", intf->cur_altsetting - intf->altsetting);
 
-	//vb2_video_unregister_device(&af9035->vdev);
+	vb2_video_unregister_device(&af9035->vdev);
 	v4l2_device_disconnect(&af9035->v4l2_dev);
 
 	af9035->udev = NULL;
