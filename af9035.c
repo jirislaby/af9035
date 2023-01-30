@@ -39,11 +39,15 @@ static int af9035_queue_setup(struct vb2_queue *vq,
 			     unsigned int *nplanes, unsigned int sizes[],
 			     struct device *alloc_devs[])
 {
-#if 1
-	WARN_ON(1);
-	return -ENODEV;
-#else
 	struct af9035 *af9035 = vb2_get_drv_priv(vq);
+#if 1
+	dev_info(&af9035->udev->dev, "%s: just guessing\n", __func__);
+	*nbuffers = 2;
+	*nplanes = 1;
+	sizes[0] = 720*576*3;
+
+	return 0;
+#else
 	unsigned size = USBTV_CHUNK * af9035->n_chunks * 2 * sizeof(u32);
 
 	if (vq->num_buffers + *nbuffers < 2)
@@ -74,14 +78,35 @@ static void af9035_buf_queue(struct vb2_buffer *vb)
 	spin_unlock_irqrestore(&af9035->buflock, flags);
 }
 
+static void af9035_reclaim_buffers(struct af9035 *af9035,
+				   enum vb2_buffer_state state)
+{
+	unsigned long flags;
+	unsigned cnt = 0;
+
+	spin_lock_irqsave(&af9035->buflock, flags);
+	while (!list_empty(&af9035->bufs)) {
+		struct af9035_buf *buf = list_first_entry(&af9035->bufs,
+				struct af9035_buf, list);
+		vb2_buffer_done(&buf->vb.vb2_buf, state);
+		list_del(&buf->list);
+		cnt++;
+	}
+	spin_unlock_irqrestore(&af9035->buflock, flags);
+}
+
 static int af9035_start_streaming(struct vb2_queue *vq, unsigned int count)
 {
 	struct af9035 *af9035 = vb2_get_drv_priv(vq);
 
 	if (af9035->udev == NULL)
-		return -ENODEV;
+		goto err;
 #if 1
-	WARN_ON(1);
+	dev_warn(&af9035->udev->dev, "%s: unimplemented\n", __func__);
+
+	return 0;
+err:
+	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_QUEUED);
 	return -ENODEV;
 #else
 	af9035->last_odd = 1;
@@ -92,11 +117,12 @@ static int af9035_start_streaming(struct vb2_queue *vq, unsigned int count)
 
 static void af9035_stop_streaming(struct vb2_queue *vq)
 {
-#if 1
-	WARN_ON(1);
-#else
 	struct af9035 *af9035 = vb2_get_drv_priv(vq);
 
+#if 1
+	dev_warn(&af9035->udev->dev, "%s: unimplemented\n", __func__);
+	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_ERROR);
+#else
 	if (af9035->udev)
 		af9035_stop(af9035);
 #endif
@@ -130,14 +156,70 @@ static const struct v4l2_file_operations af9035_fops = {
 	.poll = vb2_fop_poll,
 };
 
+static int af9035_querycap(struct file *file, void *priv,
+			   struct v4l2_capability *cap)
+{
+        struct af9035 *dev = video_drvdata(file);
+
+        strscpy(cap->driver, "af9035", sizeof(cap->driver));
+        strscpy(cap->card, "af9035", sizeof(cap->card));
+        usb_make_path(dev->udev, cap->bus_info, sizeof(cap->bus_info));
+
+        return 0;
+}
+
+static int af9035_enum_input(struct file *file, void *priv,
+			     struct v4l2_input *i)
+{
+        struct af9035 *dev = video_drvdata(file);
+
+	strscpy(i->name, "Composite", sizeof(i->name));
+        i->type = V4L2_INPUT_TYPE_CAMERA;
+        i->std = dev->vdev.tvnorms;
+
+        return 0;
+}
+
+static int af9035_enum_fmt_vid_cap(struct file *file, void  *priv,
+				   struct v4l2_fmtdesc *f)
+{
+        if (f->index > 0)
+                return -EINVAL;
+
+        f->pixelformat = V4L2_PIX_FMT_YUYV;
+
+        return 0;
+}
+
+static int af9035_fmt_vid_cap(struct file *file, void *priv,
+			      struct v4l2_format *f)
+{
+	f->fmt.pix.width = 720;
+	f->fmt.pix.height = 576;
+	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+	f->fmt.pix.field = V4L2_FIELD_INTERLACED;
+	f->fmt.pix.bytesperline = 720 * 2;
+	f->fmt.pix.sizeimage = (f->fmt.pix.bytesperline * f->fmt.pix.height);
+	f->fmt.pix.colorspace = V4L2_COLORSPACE_SMPTE170M;
+
+	return 0;
+}
+
+static int af9035_g_std(struct file *file, void *priv, v4l2_std_id *norm)
+{
+	*norm = V4L2_STD_625_50;
+
+	return 0;
+}
+
 static const struct v4l2_ioctl_ops af9035_ioctl_ops = {
-//	.vidioc_querycap = af9035_querycap,
-//	.vidioc_enum_input = af9035_enum_input,
-//	.vidioc_enum_fmt_vid_cap = af9035_enum_fmt_vid_cap,
-//	.vidioc_g_fmt_vid_cap = af9035_fmt_vid_cap,
-//	.vidioc_try_fmt_vid_cap = af9035_fmt_vid_cap,
-//	.vidioc_s_fmt_vid_cap = af9035_fmt_vid_cap,
-//	.vidioc_g_std = af9035_g_std,
+	.vidioc_querycap = af9035_querycap,
+	.vidioc_enum_input = af9035_enum_input,
+	.vidioc_enum_fmt_vid_cap = af9035_enum_fmt_vid_cap,
+	.vidioc_g_fmt_vid_cap = af9035_fmt_vid_cap,
+	.vidioc_try_fmt_vid_cap = af9035_fmt_vid_cap,
+	.vidioc_s_fmt_vid_cap = af9035_fmt_vid_cap,
+	.vidioc_g_std = af9035_g_std,
 //	.vidioc_s_std = af9035_s_std,
 //	.vidioc_g_input = af9035_g_input,
 //	.vidioc_s_input = af9035_s_input,
@@ -168,6 +250,7 @@ static int af9035_probe(struct usb_interface *intf,
 	mutex_init(&af9035->vb2q_lock);
 	mutex_init(&af9035->v4l2_lock);
 	spin_lock_init(&af9035->buflock);
+	INIT_LIST_HEAD(&af9035->bufs);
 
 	af9035->udev = usb_get_dev(interface_to_usbdev(intf));
 
