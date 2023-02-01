@@ -9,11 +9,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#ifdef USE_PCAP
 #include <pcap/pcap.h>
-#else
-#include "xxx.h"
-#endif
 
 struct usb_pkt {
 	uint64_t id;
@@ -323,12 +319,10 @@ static void handle_packet(const struct usb_pkt *pkt)
 	}
 }
 
-#ifdef USE_PCAP
 static void pcap_cb(u_char *, const struct pcap_pkthdr *, const u_char *bytes)
 {
 	handle_packet((const void *)bytes);
 }
-#endif
 
 int main(int argc, char **argv)
 {
@@ -349,7 +343,6 @@ int main(int argc, char **argv)
 		}
 	}
 
-#ifdef USE_PCAP
 	char errbuf[PCAP_ERRBUF_SIZE];
 
 	if (pcap_init(0, errbuf) < 0)
@@ -364,10 +357,6 @@ int main(int argc, char **argv)
 
 
 	pcap_close(pcap);
-#else
-	for (unsigned a = 0; a < packets_nr; a++)
-		handle_packet((const void *)packets[a]);
-#endif
 
 	return 0;
 }
