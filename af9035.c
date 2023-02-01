@@ -57,6 +57,10 @@
 
 #define AF9035_FIRMWARE "af9035.fw"
 
+#define STREAM_BUFS		15
+#define STREAM_BUFS_PER_URB	32
+#define STREAM_BUF_SIZE		3072
+
 static const u32 clock_lut_af9035[] = {
 	20480000, /*      FPGA */
 	16384000, /* 16.38 MHz */
@@ -82,8 +86,6 @@ struct af9035 {
 	u16 chip_type;
 
 	u8 eeprom[256];
-	u8 ir_mode;
-	u8 ir_type;
 	u8 af9033_i2c_addr[2];
 
 	//#define AF9035_I2C_CLIENT_MAX 4
@@ -100,6 +102,9 @@ struct af9035 {
 	struct mutex vb2q_lock;
 	struct mutex v4l2_lock;
 	struct mutex usb_lock;
+
+	void *stream_bufs[STREAM_BUFS];
+	struct urb *urbs[STREAM_BUFS];
 
 	/* List of videobuf2 buffers protected by a lock. */
 	spinlock_t buflock;
@@ -315,8 +320,9 @@ static const struct v4l2_ioctl_ops af9035_ioctl_ops = {
 	.vidioc_streamoff = vb2_ioctl_streamoff,
 };
 
-static int af9035_video_init(struct af9035 *af9035, struct usb_interface *intf)
+static int af9035_video_init(struct af9035 *af9035)
 {
+	struct usb_interface *intf = af9035->intf;
 	int ret;
 
 	/* videobuf2 structure */
@@ -810,9 +816,8 @@ static int af9035_read_config(struct af9035 *state)
 	state->af9033_config.ts_mode = AF9033_TS_MODE_USB;
 	//state->it930x_addresses = 0;
 
-	/* Remote controller */
-	state->ir_mode = state->eeprom[EEPROM_IR_MODE];
-	state->ir_type = state->eeprom[EEPROM_IR_TYPE];
+	dev_dbg(&intf->dev, "ir=%02x/%02x\n", state->eeprom[EEPROM_IR_MODE],
+		state->eeprom[EEPROM_IR_TYPE]);
 
 	/* tuner */
 	tmp = state->eeprom[EEPROM_1_TUNER_ID];
@@ -864,6 +869,58 @@ err:
 
 /* =========================== DEV =========================== */
 
+static void af9035_complete(struct af9035 *af9035, const u8 *data, unsigned len)
+{
+	WARN_ONCE(1, "unimplemented");
+}
+
+static void usb_urb_complete(struct urb *urb)
+{
+        struct af9035 *af9035 = urb->context;
+	u8 *b;
+
+	switch (urb->status) {
+	case 0:			/* success */
+	case -ETIMEDOUT:	/* NAK */
+		break;
+	case -ECONNRESET:	/* kill */
+	case -ENOENT:
+	case -ESHUTDOWN:
+		return;
+	default:        /* error */
+		dev_dbg_ratelimited(&af9035->intf->dev,
+				    "%s: urb completion failed=%d\n",
+				    __func__, urb->status);
+		break;
+	}
+
+	b = (u8 *)urb->transfer_buffer;
+	switch (usb_pipetype(urb->pipe)) {
+	case PIPE_ISOCHRONOUS:
+		for (unsigned i = 0; i < urb->number_of_packets; i++) {
+			if (urb->iso_frame_desc[i].status != 0)
+				dev_dbg(&af9035->intf->dev,
+					"%s: iso frame descriptor has an error=%d\n",
+					__func__,
+					urb->iso_frame_desc[i].status);
+			else if (urb->iso_frame_desc[i].actual_length > 0)
+				af9035_complete(af9035,
+						b + urb->iso_frame_desc[i].offset,
+						urb->iso_frame_desc[i].actual_length);
+
+			urb->iso_frame_desc[i].status = 0;
+			urb->iso_frame_desc[i].actual_length = 0;
+		}
+		break;
+	default:
+		dev_err(&af9035->intf->dev,
+			"unknown endpoint type in completion handler\n");
+		return;
+	}
+
+	usb_submit_urb(urb, GFP_ATOMIC);
+}
+
 static int af9035_load_fw(struct af9035 *af9035)
 {
 	const struct firmware *fw;
@@ -881,7 +938,114 @@ static int af9035_load_fw(struct af9035 *af9035)
 	return ret;
 }
 
-static int af9035_dev_init(struct af9035 *af9035, struct usb_interface *intf)
+static void af9035_stream_free(struct af9035 *af9035)
+{
+	for (unsigned a = 0; a < ARRAY_SIZE(af9035->stream_bufs); a++) {
+		kfree(af9035->stream_bufs[a]);
+		af9035->stream_bufs[a] = NULL;
+		usb_free_urb(af9035->urbs[a]);
+		af9035->urbs[a] = NULL;
+	}
+}
+
+static int af9035_stream_init(struct af9035 *af9035)
+{
+	/* 15 * 32 * 3072 */
+	struct usb_device *udev = interface_to_usbdev(af9035->intf);
+	struct urb *urb;
+	int ret;
+
+	ret = -ENOMEM;
+	for (unsigned i = 0; i < ARRAY_SIZE(af9035->stream_bufs); i++) {
+		af9035->stream_bufs[i] = kcalloc(STREAM_BUFS_PER_URB,
+						 STREAM_BUF_SIZE, GFP_KERNEL);
+		if (!af9035->stream_bufs[i])
+			goto err;
+
+		af9035->urbs[i] = urb = usb_alloc_urb(STREAM_BUFS_PER_URB,
+						      GFP_KERNEL);
+		if (!urb)
+			goto err;
+
+		urb->dev = udev;
+		urb->context = af9035;
+		urb->complete = usb_urb_complete;
+		urb->pipe = usb_rcvisocpipe(udev, 6);
+		urb->transfer_flags = URB_ISO_ASAP;
+		urb->interval = 1;
+		urb->number_of_packets = STREAM_BUFS_PER_URB;
+		urb->transfer_buffer_length = STREAM_BUFS_PER_URB *
+			STREAM_BUF_SIZE;
+		urb->transfer_buffer = af9035->stream_bufs[i];
+
+		for (unsigned j = 0; j < STREAM_BUFS_PER_URB; j++) {
+			urb->iso_frame_desc[j].offset = STREAM_BUF_SIZE * j;
+			urb->iso_frame_desc[j].length = STREAM_BUF_SIZE;
+		}
+	}
+
+	return 0;
+err:
+	af9035_stream_free(af9035);
+	return ret;
+}
+
+static int af9035_frontend_init(struct af9035 *af9035)
+{
+	return 0;
+}
+
+static int af9035_init(struct af9035 *af9035)
+{
+#if 0
+	struct state *state = d_to_priv(d);
+	struct usb_interface *intf = d->intf;
+	int ret, i;
+	u16 frame_size = (d->udev->speed == USB_SPEED_FULL ? 5 : 87) * 188 / 4;
+	u8 packet_size = (d->udev->speed == USB_SPEED_FULL ? 64 : 512) / 4;
+	struct reg_val_mask tab[] = {
+		{ 0x80f99d, 0x01, 0x01 },
+		{ 0x80f9a4, 0x01, 0x01 },
+		{ 0x00dd11, 0x00, 0x20 },
+		{ 0x00dd11, 0x00, 0x40 },
+		{ 0x00dd13, 0x00, 0x20 },
+		{ 0x00dd13, 0x00, 0x40 },
+		{ 0x00dd11, 0x20, 0x20 },
+		{ 0x00dd88, (frame_size >> 0) & 0xff, 0xff},
+		{ 0x00dd89, (frame_size >> 8) & 0xff, 0xff},
+		{ 0x00dd0c, packet_size, 0xff},
+		{ 0x00dd11, state->dual_mode << 6, 0x40 },
+		{ 0x00dd8a, (frame_size >> 0) & 0xff, 0xff},
+		{ 0x00dd8b, (frame_size >> 8) & 0xff, 0xff},
+		{ 0x00dd0d, packet_size, 0xff },
+		{ 0x80f9a3, state->dual_mode, 0x01 },
+		{ 0x80f9cd, state->dual_mode, 0x01 },
+		{ 0x80f99d, 0x00, 0x01 },
+		{ 0x80f9a4, 0x00, 0x01 },
+	};
+
+	dev_dbg(&intf->dev, "USB speed=%d frame_size=%04x packet_size=%02x\n",
+		d->udev->speed, frame_size, packet_size);
+
+	/* init endpoints */
+	for (i = 0; i < ARRAY_SIZE(tab); i++) {
+		ret = af9035_wr_reg_mask(d, tab[i].reg, tab[i].val,
+				tab[i].mask);
+		if (ret < 0)
+			goto err;
+	}
+
+	return 0;
+
+err:
+	dev_dbg(&intf->dev, "failed=%d\n", ret);
+
+	return ret;
+#endif
+	return 0;
+}
+
+static int af9035_dev_init(struct af9035 *af9035)
 {
 	int ret;
 
@@ -906,9 +1070,26 @@ static int af9035_dev_init(struct af9035 *af9035, struct usb_interface *intf)
 	ret = af9035_i2c_init(af9035);
 #endif
 
+	ret = af9035_stream_init(af9035);
+	if (ret < 0)
+		goto err;
+
+	ret = af9035_frontend_init(af9035);
+	if (ret < 0)
+		goto err;
+
+	ret = af9035_init(af9035);
+	if (ret < 0)
+		goto err;
+
 	return 0;
 err:
 	return ret;
+}
+
+static void af9035_dev_exit(struct af9035 *af9035)
+{
+	af9035_stream_free(af9035);
 }
 
 static int af9035_probe(struct usb_interface *intf,
@@ -932,11 +1113,11 @@ static int af9035_probe(struct usb_interface *intf,
 
 	af9035->intf = usb_get_intf(intf);
 
-	ret = af9035_dev_init(af9035, intf);
+	ret = af9035_dev_init(af9035);
 	if (ret)
 		goto err_free;
 
-	ret = af9035_video_init(af9035, intf);
+	ret = af9035_video_init(af9035);
 	if (ret)
 		goto err_dev;
 
@@ -945,6 +1126,7 @@ static int af9035_probe(struct usb_interface *intf,
 
 	return 0;
 err_dev:
+	af9035_dev_exit(af9035);
 err_free:
 	usb_put_intf(af9035->intf);
 	kfree(af9035);
@@ -965,6 +1147,7 @@ static void af9035_disconnect(struct usb_interface *intf)
 	af9035->intf = NULL;
 	usb_put_intf(af9035->intf);
 
+	af9035_dev_exit(af9035);
 	v4l2_device_put(&af9035->v4l2_dev);
 }
 
