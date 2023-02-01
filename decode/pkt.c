@@ -1,6 +1,7 @@
 #include <assert.h>
 #include <err.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -94,7 +95,8 @@ static const struct {
 	{ CMD_GENERIC_I2C_WR, "GENWR" },
 };
 
-static bool dump_isoc, verbose;
+static int dump_isoc = -1, dump_fw = -1;
+static bool verbose, silent;
 
 static void dump_data(const uint8_t *data, unsigned len)
 {
@@ -119,15 +121,10 @@ static const char *get_cmd_desc(uint8_t cmd)
 	return "UNK";
 }
 
-static const char *get_reg_name(uint8_t mbox, const uint8_t reg_arr[static 2])
+static const char *get_reg_name(uint32_t reg)
 {
 	static char buf[32];
 	const char *reg_str;
-	uint32_t reg = mbox;
-	reg <<= 8;
-	reg |= reg_arr[0];
-	reg <<= 8;
-	reg |= reg_arr[1];
 
 	switch (reg) {
 	case 0x1222:
@@ -136,6 +133,10 @@ static const char *get_reg_name(uint8_t mbox, const uint8_t reg_arr[static 2])
 		return "PRECHIP_VER";
 	case 0x417f:
 		return "PRE_EN_CLK?";
+	case 0x42f5 ... 0x42f5+256-1:
+		reg_str = "EEPROM";
+		reg -= 0x42f5;
+		break;
 	case 0xd800:
 		return "DEMOD_CLOCK";
 	case 0xd81a:
@@ -165,6 +166,7 @@ static const char *get_reg_name(uint8_t mbox, const uint8_t reg_arr[static 2])
 			reg_str = "SLEEP";
 		else
 			reg_str = "TUN_IT9135";
+		reg -= 0x800000;
 		break;
 	default:
 		reg_str = "UNK";
@@ -176,20 +178,35 @@ static const char *get_reg_name(uint8_t mbox, const uint8_t reg_arr[static 2])
 	return buf;
 }
 
+static inline uint32_t get_reg(uint8_t mbox, const uint8_t reg_arr[static 2])
+{
+	uint32_t reg = mbox;
+
+	reg <<= 8;
+	reg |= reg_arr[0];
+	reg <<= 8;
+	reg |= reg_arr[1];
+
+	return reg;
+}
+
 static bool handle_wr_cmd(const struct af9035 *af, const uint8_t *data,
 		unsigned data_len)
 {
 	switch (af->wr.cmd) {
-	case CMD_MEM_RD:
-		printf(" len=%2u reg=%-20s", data[0],
-				get_reg_name(af->wr.mbox, &data[4]));
+	case CMD_MEM_RD: {
+		uint32_t reg = get_reg(af->wr.mbox, &data[4]);
+		printf(" len=%2u reg=%.4x/%-20s", data[0], reg,
+		       get_reg_name(reg));
 		return true;
-	case CMD_MEM_WR:
-		printf(" len=%2u reg=%-20s", data[0],
-				get_reg_name(af->wr.mbox, &data[4]));
+	}
+	case CMD_MEM_WR: {
+		uint32_t reg = get_reg(af->wr.mbox, &data[4]);
+		printf(" len=%2u reg=%.4x/%-20s", data[0], reg,
+		       get_reg_name(reg));
 		dump_data(&data[6], data[0]);
 		return true;
-
+	}
 	case CMD_GENERIC_I2C_WR:
 		printf(" len=%2u bus=%.2x addr=%.2x", data[0], data[1],
 				data[2]);
@@ -203,6 +220,8 @@ static bool handle_wr_cmd(const struct af9035 *af, const uint8_t *data,
 	case CMD_FW_DL:
 		printf(" len=%u", data_len);
 		dump_data_limited(data, data_len, 20);
+		if (dump_fw >= 0)
+			write(dump_fw, data, data_len);
 		return true;
 
 	case CMD_FW_DL_BEGIN:
@@ -214,7 +233,7 @@ static bool handle_wr_cmd(const struct af9035 *af, const uint8_t *data,
 }
 
 static void handle_af9035(uint32_t sec, uint32_t usec, const struct af9035 *af,
-			  bool in)
+			  bool in, uint8_t ep)
 {
 	const uint8_t *raw = (const void *)af;
 	uint16_t csum = raw[af->len - 1];
@@ -224,14 +243,25 @@ static void handle_af9035(uint32_t sec, uint32_t usec, const struct af9035 *af,
 	csum <<= 8;
 	csum |= raw[af->len];
 
-	printf("\t%4u.%.4u BULK %s len=%2u csum=%4x", sec, usec / 100,
-	       in ? " IN" : "OUT", af->len, csum);
+	printf("\t");
+
+	if (!silent)
+		printf("%4u.%.4u", sec, usec / 100);
+
+	printf(" BULK ep=%u %s len=%2u ", ep, in ? " IN" : "OUT", af->len);
+
+	if (!silent)
+		printf("csum=%4x", csum);
 
 	if (in) {
-		printf(" seq=%3u sta=%.2x", af->rd.seq, af->rd.sta);
+		if (!silent)
+			printf(" seq=%3u", af->rd.seq);
+		printf(" sta=%.2x", af->rd.sta);
 	} else {
 		start++;
-		printf(" seq=%3u mbox=%.2x cmd=%5s", af->wr.seq, af->wr.mbox,
+		if (!silent)
+			printf(" seq=%3u", af->wr.seq);
+		printf(" mbox=%.2x cmd=%5s", af->wr.mbox,
 				get_cmd_desc(af->wr.cmd));
 		do_dump_data = !handle_wr_cmd(af, &raw[start],
 				af->len - 1 - start);
@@ -246,32 +276,39 @@ static void handle_af9035(uint32_t sec, uint32_t usec, const struct af9035 *af,
 static void handle_bulk(const struct usb_pkt *pkt, uint32_t sec)
 {
 	bool in = pkt->ep_dir & (1U << 7);
+	uint8_t ep = pkt->ep_dir & 0xf;
 
 	if (pkt->dlen)
-		handle_af9035(sec, pkt->usec, (const void *)pkt->data, in);
+		handle_af9035(sec, pkt->usec, (const void *)pkt->data, in, ep);
 }
 
 static void handle_single_isoc(const void *isoc_data, uint32_t len)
 {
 	dump_data_limited(isoc_data, len, 20);
-	if (dump_isoc)
-		write(2, isoc_data, len);
+	if (dump_isoc >= 0)
+		write(dump_isoc, isoc_data, len);
 }
 
 static void handle_isoc(const struct usb_pkt *pkt, uint32_t sec)
 {
+	const struct isoc_desc *isoc;
 	bool in = pkt->ep_dir & (1U << 7);
+	uint8_t ep = pkt->ep_dir & 0xf;
+	unsigned a, valid = 0;
 
-	printf("\t%4u.%.4u ISOC %s isoc_nr=%3u\n",
-			sec, pkt->usec / 100, in ? " IN" : "OUT",
-			pkt->isoc_nr);
+	for (a = 0, isoc = (const void *)pkt->data; a < pkt->isoc_nr; a++)
+		if (isoc->stat == 0)
+			valid++;
+
+	printf("\t%4u.%.4u ISOC ep=%u %s isoc_nr=%3u (valid=%u)\n",
+			sec, pkt->usec / 100, ep, in ? " IN" : "OUT",
+			pkt->isoc_nr, valid);
 
 	if (pkt->type == 'S')
 		return;
 
-	const struct isoc_desc *isoc = (const void *)pkt->data;
 	const void *isoc_data = isoc + pkt->isoc_nr;
-	for (unsigned a = 0; a < pkt->isoc_nr; a++, isoc++) {
+	for (a = 0, (const void *)pkt->data; a < pkt->isoc_nr; a++, isoc++) {
 		printf("\t\tIDESC %2u[%4d/%5u/%4u]", a, isoc->stat, isoc->off,
 		       isoc->len);
 		if (isoc->stat == 0)
@@ -330,10 +367,22 @@ int main(int argc, char **argv)
 
 	int o;
 
-	while ((o = getopt(argc, argv, "dv")) != -1) {
+	while ((o = getopt(argc, argv, "dfsv")) != -1) {
 		switch (o) {
 		case 'd':
-			dump_isoc = true;
+			dump_isoc = open("isoc.raw",
+					 O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (dump_isoc < 0)
+				err(1, "open(isoc.raw)");
+			break;
+		case 'f':
+			dump_fw = open("fw.raw",
+				       O_WRONLY | O_CREAT | O_TRUNC, 0644);
+			if (dump_fw < 0)
+				err(1, "open(fw.raw)");
+			break;
+		case 's':
+			silent = true;
 			break;
 		case 'v':
 			verbose = true;
@@ -357,6 +406,8 @@ int main(int argc, char **argv)
 
 
 	pcap_close(pcap);
+	close(dump_isoc);
+	close(dump_fw);
 
 	return 0;
 }
