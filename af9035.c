@@ -21,7 +21,8 @@
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
-#include "af9033.h"
+//#include "af9033.h"
+#include "blob.h"
 
 #define USB_VID_DEXATEK		0x1d19
 
@@ -43,6 +44,16 @@
 
 #define WARM			0
 #define COLD			1
+
+/*
+ * The I2C speed register is calculated with:
+ *    I2C speed register = (1000000000 / (24.4 * 16 * I2C_speed))
+ *
+ * 0x7 is ~366 kbps
+ * 0xd is ~197 kbps
+ */
+#define I2C_SPEED_366K 0x7
+#define I2C_SPEED_197k 0xd
 
 #define EEPROM_BASE_AF9035        0x42f5
 #define EEPROM_SHIFT                0x10
@@ -86,12 +97,12 @@ struct af9035 {
 	u16 chip_type;
 
 	u8 eeprom[256];
-	u8 af9033_i2c_addr[2];
+	//u8 af9033_i2c_addr[2];
 
 	//#define AF9035_I2C_CLIENT_MAX 4
 	//struct i2c_client *i2c_client[AF9035_I2C_CLIENT_MAX];
 
-	struct af9033_config af9033_config;
+	//struct af9033_config af9033_config;
 
 	struct usb_interface *intf;
 
@@ -111,281 +122,7 @@ struct af9035 {
 	struct list_head bufs;
 };
 
-
-/* =========================== V4L =========================== */
-
-struct af9035_buf {
-	struct vb2_v4l2_buffer vb;
-	struct list_head list;
-};
-
-static int af9035_queue_setup(struct vb2_queue *vq,
-			     unsigned int *nbuffers,
-			     unsigned int *nplanes, unsigned int sizes[],
-			     struct device *alloc_devs[])
-{
-	struct af9035 *af9035 = vb2_get_drv_priv(vq);
-#if 1
-	dev_info(&af9035->intf->dev, "%s: just guessing\n", __func__);
-	*nbuffers = 2;
-	*nplanes = 1;
-	sizes[0] = 720*576*3;
-
-	return 0;
-#else
-	unsigned size = USBTV_CHUNK * af9035->n_chunks * 2 * sizeof(u32);
-
-	if (vq->num_buffers + *nbuffers < 2)
-		*nbuffers = 2 - vq->num_buffers;
-	if (*nplanes)
-		return sizes[0] < size ? -EINVAL : 0;
-	*nplanes = 1;
-	sizes[0] = size;
-
-	return 0;
-#endif
-}
-
-static void af9035_buf_queue(struct vb2_buffer *vb)
-{
-	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
-	struct af9035 *af9035 = vb2_get_drv_priv(vb->vb2_queue);
-	struct af9035_buf *buf = container_of(vbuf, struct af9035_buf, vb);
-	unsigned long flags;
-
-	if (af9035->intf == NULL) {
-		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
-		return;
-	}
-
-	spin_lock_irqsave(&af9035->buflock, flags);
-	list_add_tail(&buf->list, &af9035->bufs);
-	spin_unlock_irqrestore(&af9035->buflock, flags);
-}
-
-static void af9035_reclaim_buffers(struct af9035 *af9035,
-				   enum vb2_buffer_state state)
-{
-	unsigned long flags;
-	unsigned cnt = 0;
-
-	spin_lock_irqsave(&af9035->buflock, flags);
-	while (!list_empty(&af9035->bufs)) {
-		struct af9035_buf *buf = list_first_entry(&af9035->bufs,
-				struct af9035_buf, list);
-		vb2_buffer_done(&buf->vb.vb2_buf, state);
-		list_del(&buf->list);
-		cnt++;
-	}
-	spin_unlock_irqrestore(&af9035->buflock, flags);
-}
-
-static int af9035_start_streaming(struct vb2_queue *vq, unsigned int count)
-{
-	struct af9035 *af9035 = vb2_get_drv_priv(vq);
-
-	if (af9035->intf == NULL)
-		goto err;
-#if 1
-	dev_warn(&af9035->intf->dev, "%s: unimplemented\n", __func__);
-
-	return 0;
-err:
-	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_QUEUED);
-	return -ENODEV;
-#else
-	af9035->last_odd = 1;
-	af9035->sequence = 0;
-	return af9035_start(af9035);
-#endif
-}
-
-static void af9035_stop_streaming(struct vb2_queue *vq)
-{
-	struct af9035 *af9035 = vb2_get_drv_priv(vq);
-
-#if 1
-	dev_warn(&af9035->intf->dev, "%s: unimplemented\n", __func__);
-	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_ERROR);
-#else
-	if (af9035->intf)
-		af9035_stop(af9035);
-#endif
-}
-
-static const struct vb2_ops af9035_vb2_ops = {
-	.queue_setup = af9035_queue_setup,
-	.buf_queue = af9035_buf_queue,
-	.start_streaming = af9035_start_streaming,
-	.stop_streaming = af9035_stop_streaming,
-	.wait_prepare = vb2_ops_wait_prepare,
-	.wait_finish = vb2_ops_wait_finish,
-};
-
-static void af9035_release(struct v4l2_device *v4l2_dev)
-{
-	struct af9035 *af9035 = container_of(v4l2_dev, struct af9035, v4l2_dev);
-
-	v4l2_device_unregister(&af9035->v4l2_dev);
-	pr_info("%s: FREE\n", __func__);
-	kfree(af9035);
-}
-
-static const struct v4l2_file_operations af9035_fops = {
-	.owner = THIS_MODULE,
-	.unlocked_ioctl = video_ioctl2,
-	.mmap = vb2_fop_mmap,
-	.open = v4l2_fh_open,
-	.release = vb2_fop_release,
-	.read = vb2_fop_read,
-	.poll = vb2_fop_poll,
-};
-
-static int af9035_querycap(struct file *file, void *priv,
-			   struct v4l2_capability *cap)
-{
-        struct af9035 *dev = video_drvdata(file);
-
-        strscpy(cap->driver, "af9035", sizeof(cap->driver));
-        strscpy(cap->card, "af9035", sizeof(cap->card));
-        usb_make_path(interface_to_usbdev(dev->intf), cap->bus_info,
-			sizeof(cap->bus_info));
-
-        return 0;
-}
-
-static int af9035_enum_input(struct file *file, void *priv,
-			     struct v4l2_input *i)
-{
-        struct af9035 *dev = video_drvdata(file);
-
-	strscpy(i->name, "Composite", sizeof(i->name));
-        i->type = V4L2_INPUT_TYPE_CAMERA;
-        i->std = dev->vdev.tvnorms;
-
-        return 0;
-}
-
-static int af9035_enum_fmt_vid_cap(struct file *file, void  *priv,
-				   struct v4l2_fmtdesc *f)
-{
-        if (f->index > 0)
-                return -EINVAL;
-
-        f->pixelformat = V4L2_PIX_FMT_UYVY;
-
-        return 0;
-}
-
-static int af9035_fmt_vid_cap(struct file *file, void *priv,
-			      struct v4l2_format *f)
-{
-	f->fmt.pix.width = 720;
-	f->fmt.pix.height = 576;
-	f->fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
-	f->fmt.pix.field = V4L2_FIELD_SEQ_BT;
-	f->fmt.pix.bytesperline = 720 * 2;
-	f->fmt.pix.sizeimage = (f->fmt.pix.bytesperline * f->fmt.pix.height);
-	f->fmt.pix.colorspace = V4L2_COLORSPACE_DEFAULT;
-
-	return 0;
-}
-
-static int af9035_g_std(struct file *file, void *priv, v4l2_std_id *norm)
-{
-	*norm = V4L2_STD_625_50;
-
-	return 0;
-}
-
-static const struct v4l2_ioctl_ops af9035_ioctl_ops = {
-	.vidioc_querycap = af9035_querycap,
-	.vidioc_enum_input = af9035_enum_input,
-	.vidioc_enum_fmt_vid_cap = af9035_enum_fmt_vid_cap,
-	.vidioc_g_fmt_vid_cap = af9035_fmt_vid_cap,
-	.vidioc_try_fmt_vid_cap = af9035_fmt_vid_cap,
-	.vidioc_s_fmt_vid_cap = af9035_fmt_vid_cap,
-	.vidioc_g_std = af9035_g_std,
-//	.vidioc_s_std = af9035_s_std,
-//	.vidioc_g_input = af9035_g_input,
-//	.vidioc_s_input = af9035_s_input,
-
-	.vidioc_reqbufs = vb2_ioctl_reqbufs,
-	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
-	.vidioc_querybuf = vb2_ioctl_querybuf,
-	.vidioc_create_bufs = vb2_ioctl_create_bufs,
-	.vidioc_qbuf = vb2_ioctl_qbuf,
-	.vidioc_dqbuf = vb2_ioctl_dqbuf,
-	.vidioc_streamon = vb2_ioctl_streamon,
-	.vidioc_streamoff = vb2_ioctl_streamoff,
-};
-
-static int af9035_video_init(struct af9035 *af9035)
-{
-	struct usb_interface *intf = af9035->intf;
-	int ret;
-
-	/* videobuf2 structure */
-	af9035->vb2q.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	af9035->vb2q.io_modes = VB2_MMAP | VB2_USERPTR | VB2_READ;
-	af9035->vb2q.drv_priv = af9035;
-	af9035->vb2q.buf_struct_size = sizeof(struct af9035_buf);
-	af9035->vb2q.ops = &af9035_vb2_ops;
-	af9035->vb2q.mem_ops = &vb2_vmalloc_memops;
-	af9035->vb2q.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-	af9035->vb2q.lock = &af9035->vb2q_lock;
-	ret = vb2_queue_init(&af9035->vb2q);
-	if (ret < 0) {
-		dev_err(&intf->dev, "Could not initialize videobuf2 queue\n");
-		goto err;
-	}
-
-	af9035->v4l2_dev.release = af9035_release;
-	ret = v4l2_device_register(&intf->dev, &af9035->v4l2_dev);
-	if (ret < 0) {
-		dev_err(&intf->dev, "Could not register v4l2 device\n");
-		goto err;
-	}
-
-	/* Video structure */
-	strscpy(af9035->vdev.name, "af9035", sizeof(af9035->vdev.name));
-	af9035->vdev.v4l2_dev = &af9035->v4l2_dev;
-	af9035->vdev.release = video_device_release_empty;
-	af9035->vdev.fops = &af9035_fops;
-	af9035->vdev.ioctl_ops = &af9035_ioctl_ops;
-	af9035->vdev.tvnorms = V4L2_STD_PAL_D;
-	af9035->vdev.queue = &af9035->vb2q;
-	af9035->vdev.lock = &af9035->v4l2_lock;
-	af9035->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
-		V4L2_CAP_STREAMING;
-	video_set_drvdata(&af9035->vdev, af9035);
-	ret = video_register_device(&af9035->vdev, VFL_TYPE_VIDEO, -1);
-	if (ret < 0) {
-		dev_warn(&intf->dev, "Could not register video device\n");
-		goto err_v4l2;
-	}
-
-	return 0;
-err_v4l2:
-	v4l2_device_unregister(&af9035->v4l2_dev);
-err:
-	return ret;
-}
-
-static void af9035_video_free(struct af9035 *af9035)
-{
-	mutex_lock(&af9035->vb2q_lock);
-	mutex_lock(&af9035->v4l2_lock);
-
-	//af9035_stop(af9035);
-	vb2_video_unregister_device(&af9035->vdev);
-	v4l2_device_disconnect(&af9035->v4l2_dev);
-
-	mutex_unlock(&af9035->v4l2_lock);
-	mutex_unlock(&af9035->vb2q_lock);
-
-	v4l2_device_put(&af9035->v4l2_dev);
-}
+static int af9035_sleep(struct af9035 *af9035);
 
 /* =========================== FROM dvb_usb_urb.c =========================== */
 
@@ -437,7 +174,7 @@ struct usb_req {
 	u8  cmd;
 	u8  mbox;
 	u8  wlen;
-	u8  *wbuf;
+	const u8  *wbuf;
 	u8  rlen;
 	u8  *rbuf;
 };
@@ -537,9 +274,8 @@ exit:
 	return ret;
 }
 
-#if 0
 /* write multiple registers */
-static int af9035_wr_regs(struct af9035 *state, u32 reg, u8 *val, int len)
+static int af9035_wr_regs(struct af9035 *state, u32 reg, const u8 *val, int len)
 {
 	struct usb_interface *intf = state->intf;
 	u8 wbuf[MAX_XFER_SIZE];
@@ -561,7 +297,20 @@ static int af9035_wr_regs(struct af9035 *state, u32 reg, u8 *val, int len)
 
 	return af9035_ctrl_msg(state, &req);
 }
-#endif
+
+static int af9035_wr_i2c(struct af9035 *state, u8 mbox, u8 bus, u8 addr,
+			 const u8 *val, int len)
+{
+	u8 buf[MAX_XFER_SIZE];
+	struct usb_req req = { CMD_GENERIC_I2C_WR, 0, 3 + len, buf, 0, NULL };
+
+	req.mbox = mbox;
+	buf[0] = len;
+	buf[1] = bus;
+	buf[2] = addr << 1;
+	memcpy(&buf[3], val, len);
+	return af9035_ctrl_msg(state, &req);
+}
 
 /* read multiple registers */
 static int af9035_rd_regs(struct af9035 *state, u32 reg, u8 *val, int len)
@@ -573,13 +322,11 @@ static int af9035_rd_regs(struct af9035 *state, u32 reg, u8 *val, int len)
 	return af9035_ctrl_msg(state, &req);
 }
 
-#if 0
 /* write single register */
 static int af9035_wr_reg(struct af9035 *state, u32 reg, u8 val)
 {
 	return af9035_wr_regs(state, reg, &val, 1);
 }
-#endif
 
 /* read single register */
 static int af9035_rd_reg(struct af9035 *state, u32 reg, u8 *val)
@@ -609,6 +356,30 @@ static int af9035_wr_reg_mask(struct af9035 *state, u32 reg, u8 val,
 	return af9035_wr_regs(state, reg, &val, 1);
 }
 #endif
+
+static int af9035_write_blob(struct af9035 *af9035,
+			     const struct af9035_blob *blob, unsigned size)
+{
+	unsigned i;
+	int ret;
+
+	for (i = 0; i < size; i++) {
+		if (blob[i].type == 0) {
+			ret = af9035_wr_regs(af9035, blob[i].reg, blob[i].data,
+						 blob[i].len);
+			if (ret)
+				return ret;
+		} else {
+			ret = af9035_wr_i2c(af9035, 0, blob[i].bus,
+					    blob[i].addr, blob[i].data,
+					    blob[i].len);
+			if (ret)
+				return ret;
+		}
+	}
+
+	return 0;
+}
 
 static int af9035_identify_state(struct af9035 *state)
 {
@@ -809,11 +580,13 @@ static int af9035_read_config(struct af9035 *state)
 	u8 tmp;
 	u16 tmp16;
 
+#if 0
 	/* Demod I2C address */
 	state->af9033_i2c_addr[0] = 0x1c;
 	state->af9033_i2c_addr[1] = 0x1d;
 	state->af9033_config.adc_multiplier = AF9033_ADC_MULTIPLIER_2X;
 	state->af9033_config.ts_mode = AF9033_TS_MODE_USB;
+#endif
 	//state->it930x_addresses = 0;
 
 	dev_dbg(&intf->dev, "ir=%02x/%02x\n", state->eeprom[EEPROM_IR_MODE],
@@ -828,7 +601,7 @@ static int af9035_read_config(struct af9035 *state)
 
 	dev_dbg(&intf->dev, "tuner=%02x\n", tmp);
 
-	state->af9033_config.tuner = tmp;
+	//state->af9033_config.tuner = tmp;
 
 	/* tuner IF frequency */
 	tmp = state->eeprom[EEPROM_1_IF_L];
@@ -854,10 +627,10 @@ static int af9035_read_config(struct af9035 *state)
 		return -EINVAL;
 	}
 
-	state->af9033_config.clock = clock_lut_af9035[tmp];
+	//state->af9033_config.clock = clock_lut_af9035[tmp];
 
 	dev_dbg(&intf->dev, "demod clk=%u -> %u kHz\n", tmp,
-		state->af9033_config.clock / 1000);
+		clock_lut_af9035[tmp] / 1000);
 
 	return 0;
 
@@ -865,6 +638,317 @@ err:
 	dev_dbg(&intf->dev, "failed=%d\n", ret);
 
 	return ret;
+}
+
+/* =========================== V4L =========================== */
+
+struct af9035_buf {
+	struct vb2_v4l2_buffer vb;
+	struct list_head list;
+};
+
+static int af9035_queue_setup(struct vb2_queue *vq,
+			     unsigned int *nbuffers,
+			     unsigned int *nplanes, unsigned int sizes[],
+			     struct device *alloc_devs[])
+{
+	struct af9035 *af9035 = vb2_get_drv_priv(vq);
+#if 1
+	dev_info(&af9035->intf->dev, "%s: just guessing\n", __func__);
+	*nbuffers = 2;
+	*nplanes = 1;
+	sizes[0] = 720*576*3;
+
+	return 0;
+#else
+	unsigned size = USBTV_CHUNK * af9035->n_chunks * 2 * sizeof(u32);
+
+	if (vq->num_buffers + *nbuffers < 2)
+		*nbuffers = 2 - vq->num_buffers;
+	if (*nplanes)
+		return sizes[0] < size ? -EINVAL : 0;
+	*nplanes = 1;
+	sizes[0] = size;
+
+	return 0;
+#endif
+}
+
+static void af9035_buf_queue(struct vb2_buffer *vb)
+{
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct af9035 *af9035 = vb2_get_drv_priv(vb->vb2_queue);
+	struct af9035_buf *buf = container_of(vbuf, struct af9035_buf, vb);
+	unsigned long flags;
+
+	if (af9035->intf == NULL) {
+		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
+		return;
+	}
+
+	spin_lock_irqsave(&af9035->buflock, flags);
+	list_add_tail(&buf->list, &af9035->bufs);
+	spin_unlock_irqrestore(&af9035->buflock, flags);
+}
+
+static void af9035_reclaim_buffers(struct af9035 *af9035,
+				   enum vb2_buffer_state state)
+{
+	unsigned long flags;
+	unsigned cnt = 0;
+
+	spin_lock_irqsave(&af9035->buflock, flags);
+	while (!list_empty(&af9035->bufs)) {
+		struct af9035_buf *buf = list_first_entry(&af9035->bufs,
+				struct af9035_buf, list);
+		vb2_buffer_done(&buf->vb.vb2_buf, state);
+		list_del(&buf->list);
+		cnt++;
+	}
+	spin_unlock_irqrestore(&af9035->buflock, flags);
+}
+
+static void af9035_kill_urbs(struct af9035 *af9035)
+{
+        for (unsigned i = 0; i < STREAM_BUFS; i++) {
+                dev_dbg(&af9035->intf->dev, "%s: kill urb=%d\n", __func__, i);
+                usb_kill_urb(af9035->urbs[i]);
+        }
+}
+
+static int af9035_submit_urbs(struct af9035 *af9035)
+{
+	int ret;
+
+        for (unsigned i = 0; i < STREAM_BUFS; i++) {
+                dev_dbg(&af9035->intf->dev, "%s: submit urb=%d\n", __func__, i);
+                ret = usb_submit_urb(af9035->urbs[i], GFP_ATOMIC);
+                if (ret) {
+                        dev_err(&af9035->intf->dev,
+                                        "%s: could not submit urb no. %d - get them all back\n",
+                                        __func__, i);
+                        af9035_kill_urbs(af9035);
+                        return ret;
+                }
+        }
+
+	return 0;
+}
+
+static int af9035_start_streaming(struct vb2_queue *vq, unsigned int count)
+{
+	struct af9035 *af9035 = vb2_get_drv_priv(vq);
+	int ret;
+
+	if (af9035->intf == NULL) {
+		ret = -ENODEV;
+		goto err;
+	}
+
+	ret = af9035_write_blob(af9035, af9035_start_blob1,
+				ARRAY_SIZE(af9035_start_blob1));
+	if (ret)
+		goto err;
+
+	ret = af9035_submit_urbs(af9035);
+	if (ret)
+		goto err;
+
+	ret = af9035_write_blob(af9035, af9035_start_blob2,
+				ARRAY_SIZE(af9035_start_blob2));
+	if (ret)
+		goto err;
+
+	return 0;
+err:
+	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_QUEUED);
+	return ret;
+}
+
+static void af9035_stop_streaming(struct vb2_queue *vq)
+{
+	struct af9035 *af9035 = vb2_get_drv_priv(vq);
+
+	if (af9035->intf) {
+		af9035_sleep(af9035);
+		af9035_kill_urbs(af9035);
+	}
+
+	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_ERROR);
+}
+
+static const struct vb2_ops af9035_vb2_ops = {
+	.queue_setup = af9035_queue_setup,
+	.buf_queue = af9035_buf_queue,
+	.start_streaming = af9035_start_streaming,
+	.stop_streaming = af9035_stop_streaming,
+	.wait_prepare = vb2_ops_wait_prepare,
+	.wait_finish = vb2_ops_wait_finish,
+};
+
+static void af9035_release(struct v4l2_device *v4l2_dev)
+{
+	struct af9035 *af9035 = container_of(v4l2_dev, struct af9035, v4l2_dev);
+
+	v4l2_device_unregister(&af9035->v4l2_dev);
+	pr_info("%s: FREE\n", __func__);
+	kfree(af9035);
+}
+
+static const struct v4l2_file_operations af9035_fops = {
+	.owner = THIS_MODULE,
+	.unlocked_ioctl = video_ioctl2,
+	.mmap = vb2_fop_mmap,
+	.open = v4l2_fh_open,
+	.release = vb2_fop_release,
+	.read = vb2_fop_read,
+	.poll = vb2_fop_poll,
+};
+
+static int af9035_querycap(struct file *file, void *priv,
+			   struct v4l2_capability *cap)
+{
+        struct af9035 *dev = video_drvdata(file);
+
+        strscpy(cap->driver, "af9035", sizeof(cap->driver));
+        strscpy(cap->card, "af9035", sizeof(cap->card));
+        usb_make_path(interface_to_usbdev(dev->intf), cap->bus_info,
+			sizeof(cap->bus_info));
+
+        return 0;
+}
+
+static int af9035_enum_input(struct file *file, void *priv,
+			     struct v4l2_input *i)
+{
+        struct af9035 *dev = video_drvdata(file);
+
+	strscpy(i->name, "Composite", sizeof(i->name));
+        i->type = V4L2_INPUT_TYPE_CAMERA;
+        i->std = dev->vdev.tvnorms;
+
+        return 0;
+}
+
+static int af9035_enum_fmt_vid_cap(struct file *file, void  *priv,
+				   struct v4l2_fmtdesc *f)
+{
+        if (f->index > 0)
+                return -EINVAL;
+
+        f->pixelformat = V4L2_PIX_FMT_UYVY;
+
+        return 0;
+}
+
+static int af9035_fmt_vid_cap(struct file *file, void *priv,
+			      struct v4l2_format *f)
+{
+	f->fmt.pix.width = 720;
+	f->fmt.pix.height = 576;
+	f->fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
+	f->fmt.pix.field = V4L2_FIELD_SEQ_BT;
+	f->fmt.pix.bytesperline = 720 * 2;
+	f->fmt.pix.sizeimage = (f->fmt.pix.bytesperline * f->fmt.pix.height);
+	f->fmt.pix.colorspace = V4L2_COLORSPACE_DEFAULT;
+
+	return 0;
+}
+
+static int af9035_g_std(struct file *file, void *priv, v4l2_std_id *norm)
+{
+	*norm = V4L2_STD_625_50;
+
+	return 0;
+}
+
+static const struct v4l2_ioctl_ops af9035_ioctl_ops = {
+	.vidioc_querycap = af9035_querycap,
+	.vidioc_enum_input = af9035_enum_input,
+	.vidioc_enum_fmt_vid_cap = af9035_enum_fmt_vid_cap,
+	.vidioc_g_fmt_vid_cap = af9035_fmt_vid_cap,
+	.vidioc_try_fmt_vid_cap = af9035_fmt_vid_cap,
+	.vidioc_s_fmt_vid_cap = af9035_fmt_vid_cap,
+	.vidioc_g_std = af9035_g_std,
+//	.vidioc_s_std = af9035_s_std,
+//	.vidioc_g_input = af9035_g_input,
+//	.vidioc_s_input = af9035_s_input,
+
+	.vidioc_reqbufs = vb2_ioctl_reqbufs,
+	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
+	.vidioc_querybuf = vb2_ioctl_querybuf,
+	.vidioc_create_bufs = vb2_ioctl_create_bufs,
+	.vidioc_qbuf = vb2_ioctl_qbuf,
+	.vidioc_dqbuf = vb2_ioctl_dqbuf,
+	.vidioc_streamon = vb2_ioctl_streamon,
+	.vidioc_streamoff = vb2_ioctl_streamoff,
+};
+
+static int af9035_video_init(struct af9035 *af9035)
+{
+	struct usb_interface *intf = af9035->intf;
+	int ret;
+
+	/* videobuf2 structure */
+	af9035->vb2q.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	af9035->vb2q.io_modes = VB2_MMAP | VB2_USERPTR | VB2_READ;
+	af9035->vb2q.drv_priv = af9035;
+	af9035->vb2q.buf_struct_size = sizeof(struct af9035_buf);
+	af9035->vb2q.ops = &af9035_vb2_ops;
+	af9035->vb2q.mem_ops = &vb2_vmalloc_memops;
+	af9035->vb2q.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	af9035->vb2q.lock = &af9035->vb2q_lock;
+	ret = vb2_queue_init(&af9035->vb2q);
+	if (ret < 0) {
+		dev_err(&intf->dev, "Could not initialize videobuf2 queue\n");
+		goto err;
+	}
+
+	af9035->v4l2_dev.release = af9035_release;
+	ret = v4l2_device_register(&intf->dev, &af9035->v4l2_dev);
+	if (ret < 0) {
+		dev_err(&intf->dev, "Could not register v4l2 device\n");
+		goto err;
+	}
+
+	/* Video structure */
+	strscpy(af9035->vdev.name, "af9035", sizeof(af9035->vdev.name));
+	af9035->vdev.v4l2_dev = &af9035->v4l2_dev;
+	af9035->vdev.release = video_device_release_empty;
+	af9035->vdev.fops = &af9035_fops;
+	af9035->vdev.ioctl_ops = &af9035_ioctl_ops;
+	af9035->vdev.tvnorms = V4L2_STD_PAL_D;
+	af9035->vdev.queue = &af9035->vb2q;
+	af9035->vdev.lock = &af9035->v4l2_lock;
+	af9035->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
+		V4L2_CAP_STREAMING;
+	video_set_drvdata(&af9035->vdev, af9035);
+	ret = video_register_device(&af9035->vdev, VFL_TYPE_VIDEO, -1);
+	if (ret < 0) {
+		dev_warn(&intf->dev, "Could not register video device\n");
+		goto err_v4l2;
+	}
+
+	return 0;
+err_v4l2:
+	v4l2_device_unregister(&af9035->v4l2_dev);
+err:
+	return ret;
+}
+
+static void af9035_video_free(struct af9035 *af9035)
+{
+	mutex_lock(&af9035->vb2q_lock);
+	mutex_lock(&af9035->v4l2_lock);
+
+	//af9035_stop(af9035);
+	vb2_video_unregister_device(&af9035->vdev);
+	v4l2_device_disconnect(&af9035->v4l2_dev);
+
+	mutex_unlock(&af9035->v4l2_lock);
+	mutex_unlock(&af9035->vb2q_lock);
+
+	v4l2_device_put(&af9035->v4l2_dev);
 }
 
 /* =========================== DEV =========================== */
@@ -990,59 +1074,65 @@ err:
 	return ret;
 }
 
-static int af9035_frontend_init(struct af9035 *af9035)
+static int af9035_sleep(struct af9035 *af9035)
 {
+	unsigned counter = 20;
+	int ret;
+	u8 tmp;
+
+	ret = af9035_wr_reg(af9035, 0x80004c, 0x01);
+	if (ret)
+		return ret;
+	ret = af9035_wr_reg(af9035, 0x800000, 0x00);
+	if (ret)
+		return ret;
+
+	do {
+		ret = af9035_rd_reg(af9035, 0x80004c, &tmp);
+		if (ret)
+			return ret;
+		if (tmp == 0)
+			break;
+		msleep(5);
+	} while (counter-- > 0);
+
+	ret = af9035_rd_reg(af9035, 0x80fb24, &tmp);
+	if (ret)
+		return ret;
+	tmp |= 0x08;
+	ret = af9035_wr_reg(af9035, 0x80fb24, tmp);
+	if (ret)
+		return ret;
+
 	return 0;
 }
 
-static int af9035_init(struct af9035 *af9035)
+static int af9035_frontend_init(struct af9035 *af9035)
 {
-#if 0
-	struct state *state = d_to_priv(d);
-	struct usb_interface *intf = d->intf;
-	int ret, i;
-	u16 frame_size = (d->udev->speed == USB_SPEED_FULL ? 5 : 87) * 188 / 4;
-	u8 packet_size = (d->udev->speed == USB_SPEED_FULL ? 64 : 512) / 4;
-	struct reg_val_mask tab[] = {
-		{ 0x80f99d, 0x01, 0x01 },
-		{ 0x80f9a4, 0x01, 0x01 },
-		{ 0x00dd11, 0x00, 0x20 },
-		{ 0x00dd11, 0x00, 0x40 },
-		{ 0x00dd13, 0x00, 0x20 },
-		{ 0x00dd13, 0x00, 0x40 },
-		{ 0x00dd11, 0x20, 0x20 },
-		{ 0x00dd88, (frame_size >> 0) & 0xff, 0xff},
-		{ 0x00dd89, (frame_size >> 8) & 0xff, 0xff},
-		{ 0x00dd0c, packet_size, 0xff},
-		{ 0x00dd11, state->dual_mode << 6, 0x40 },
-		{ 0x00dd8a, (frame_size >> 0) & 0xff, 0xff},
-		{ 0x00dd8b, (frame_size >> 8) & 0xff, 0xff},
-		{ 0x00dd0d, packet_size, 0xff },
-		{ 0x80f9a3, state->dual_mode, 0x01 },
-		{ 0x80f9cd, state->dual_mode, 0x01 },
-		{ 0x80f99d, 0x00, 0x01 },
-		{ 0x80f9a4, 0x00, 0x01 },
-	};
+	static const u8 wbuf[4] = { 0x00, 0x08, 0x00, 0x00 };
+	int ret;
 
-	dev_dbg(&intf->dev, "USB speed=%d frame_size=%04x packet_size=%02x\n",
-		d->udev->speed, frame_size, packet_size);
+	/* I2C master bus 1,3 clock speed 366k */
+	ret = af9035_wr_reg(af9035, 0x00f103, I2C_SPEED_197k);
+	if (ret < 0)
+		return ret;
 
-	/* init endpoints */
-	for (i = 0; i < ARRAY_SIZE(tab); i++) {
-		ret = af9035_wr_reg_mask(d, tab[i].reg, tab[i].val,
-				tab[i].mask);
-		if (ret < 0)
-			goto err;
-	}
+	/* tuner type */
+	ret = af9035_wr_reg(af9035, 0xf641, 0x26);
+	if (ret < 0)
+		return ret;
 
-	return 0;
+	ret = af9035_write_blob(af9035, af9035_init_blob,
+				ARRAY_SIZE(af9035_init_blob));
+	if (ret < 0)
+		return ret;
 
-err:
-	dev_dbg(&intf->dev, "failed=%d\n", ret);
+	/* likely unneeded as it (expectedly) fails */
+	ret = af9035_wr_i2c(af9035, 0, 0x02, 0xc2, wbuf, sizeof(wbuf));
+	if (!ret || af9035->buf[2] != 4)
+		return ret;
 
-	return ret;
-#endif
-	return 0;
+	return af9035_sleep(af9035);
 }
 
 static int af9035_dev_init(struct af9035 *af9035)
@@ -1066,19 +1156,11 @@ static int af9035_dev_init(struct af9035 *af9035)
 	if (ret < 0)
 		goto err;
 
-#if 0
-	ret = af9035_i2c_init(af9035);
-#endif
-
 	ret = af9035_stream_init(af9035);
 	if (ret < 0)
 		goto err;
 
 	ret = af9035_frontend_init(af9035);
-	if (ret < 0)
-		goto err;
-
-	ret = af9035_init(af9035);
 	if (ret < 0)
 		goto err;
 
