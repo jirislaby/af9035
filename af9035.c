@@ -367,14 +367,22 @@ static int af9035_write_blob(struct af9035 *af9035,
 		if (blob[i].type == 0) {
 			ret = af9035_wr_regs(af9035, blob[i].reg, blob[i].data,
 						 blob[i].len);
-			if (ret)
+			if (ret) {
+				dev_err(&af9035->intf->dev,
+					"%uth blob failed\n", i);
 				return ret;
+			}
 		} else {
 			ret = af9035_wr_i2c(af9035, 0, blob[i].bus,
 					    blob[i].addr, blob[i].data,
 					    blob[i].len);
-			if (ret)
-				return ret;
+			if (ret) {
+				if (af9035->buf[2] != blob[i].sta) {
+					dev_err(&af9035->intf->dev,
+						"%uth blob failed\n", i);
+					return ret;
+				}
+			}
 		}
 	}
 
@@ -747,19 +755,28 @@ static int af9035_start_streaming(struct vb2_queue *vq, unsigned int count)
 
 	ret = af9035_write_blob(af9035, af9035_start_blob1,
 				ARRAY_SIZE(af9035_start_blob1));
-	if (ret)
+	if (ret) {
+		dev_err(&af9035->intf->dev, "%s: 1st blob failed\n", __func__);
 		goto err;
+	}
 
 	ret = af9035_submit_urbs(af9035);
-	if (ret)
+	if (ret) {
+		dev_err(&af9035->intf->dev, "%s: submit urbs failed\n",
+			__func__);
 		goto err;
+	}
 
 	ret = af9035_write_blob(af9035, af9035_start_blob2,
 				ARRAY_SIZE(af9035_start_blob2));
-	if (ret)
-		goto err;
+	if (ret) {
+		dev_err(&af9035->intf->dev, "%s: 2nd blob failed\n", __func__);
+		goto err_urbs;
+	}
 
 	return 0;
+err_urbs:
+	af9035_kill_urbs(af9035);
 err:
 	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_QUEUED);
 	return ret;
@@ -1035,6 +1052,7 @@ static void af9035_stream_free(struct af9035 *af9035)
 static int af9035_stream_init(struct af9035 *af9035)
 {
 	/* 15 * 32 * 3072 */
+	struct usb_host_endpoint *ep;
 	struct usb_device *udev = interface_to_usbdev(af9035->intf);
 	struct urb *urb;
 	int ret;
@@ -1054,13 +1072,17 @@ static int af9035_stream_init(struct af9035 *af9035)
 		urb->dev = udev;
 		urb->context = af9035;
 		urb->complete = usb_urb_complete;
-		urb->pipe = usb_rcvisocpipe(udev, 6);
+		urb->pipe = usb_rcvisocpipe(udev, 0x86);
 		urb->transfer_flags = URB_ISO_ASAP;
 		urb->interval = 1;
 		urb->number_of_packets = STREAM_BUFS_PER_URB;
 		urb->transfer_buffer_length = STREAM_BUFS_PER_URB *
 			STREAM_BUF_SIZE;
 		urb->transfer_buffer = af9035->stream_bufs[i];
+
+		ep = usb_pipe_endpoint(udev, urb->pipe);
+		dev_dbg(&af9035->intf->dev, "urb pipe=%.8x maxp=%d\n",
+			urb->pipe, usb_endpoint_maxp(&ep->desc));
 
 		for (unsigned j = 0; j < STREAM_BUFS_PER_URB; j++) {
 			urb->iso_frame_desc[j].offset = STREAM_BUF_SIZE * j;
@@ -1179,6 +1201,16 @@ static int af9035_probe(struct usb_interface *intf,
 {
 	struct af9035 *af9035;
 	int ret;
+
+#if 0
+	ret = usb_set_interface(interface_to_usbdev(intf), 0, 1);
+	if (ret) {
+		dev_info(&intf->dev, "%s: cannot set altset to 1\n", __func__);
+		return ret;
+	}
+
+	msleep(200);
+#endif
 
 	dev_info(&intf->dev, "%s: altset=%zu\n", __func__,
 		 intf->cur_altsetting - intf->altsetting);
