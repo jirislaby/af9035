@@ -91,18 +91,18 @@ static const struct {
 	{ CMD_FW_DL_BEGIN   , "DLBEG" },
 	{ CMD_FW_DL_END     , "DLEND" },
 	{ CMD_FW_SCATTER_WR , "SCWR" },
-	{ CMD_GENERIC_I2C_RD, "GENRD" },
-	{ CMD_GENERIC_I2C_WR, "GENWR" },
+	{ CMD_GENERIC_I2C_RD, "I2CRD" },
+	{ CMD_GENERIC_I2C_WR, "I2CWR" },
 };
 
 static int dump_isoc = -1, dump_fw = -1;
-static bool verbose, silent;
+static bool verbose, silent, hex_data;
 
 static void dump_data(const uint8_t *data, unsigned len)
 {
 	printf(" data=");
 	for (unsigned a = 0; a < len; a++)
-		printf(" %.2x", data[a]);
+		printf("%s%.2x", hex_data ? ", 0x" : " ", data[a]);
 }
 
 static void dump_data_limited(const uint8_t *data, unsigned len, unsigned limit)
@@ -143,6 +143,8 @@ static const char *get_reg_name(uint32_t reg)
 		return "EN_CLK";
 	case 0xf103:
 		return "I2Cm13_CLK_SPD";
+	case 0xf641:
+		return "TUNER_TYPE";
 	case 0xf6a7:
 		return "I2Cm2_CLK_SPD";
 	case 0xd827 ... 0xd829:
@@ -196,20 +198,24 @@ static bool handle_wr_cmd(const struct af9035 *af, const uint8_t *data,
 	switch (af->wr.cmd) {
 	case CMD_MEM_RD: {
 		uint32_t reg = get_reg(af->wr.mbox, &data[4]);
-		printf(" len=%2u reg=%.4x/%-20s", data[0], reg,
+		printf(" len=%2u reg=%.6x/%-20s", data[0], reg,
 		       get_reg_name(reg));
 		return true;
 	}
 	case CMD_MEM_WR: {
 		uint32_t reg = get_reg(af->wr.mbox, &data[4]);
-		printf(" len=%2u reg=%.4x/%-20s", data[0], reg,
+		printf(" len=%2u reg=%.6x/%-20s", data[0], reg,
 		       get_reg_name(reg));
 		dump_data(&data[6], data[0]);
 		return true;
 	}
+	case CMD_GENERIC_I2C_RD:
+		printf(" len=%2u bus=%.2x addr=%.2x%s", data[0], data[1],
+				data[2] >> 1, data[2] & 1 ? "" : "!");
+		return true;
 	case CMD_GENERIC_I2C_WR:
-		printf(" len=%2u bus=%.2x addr=%.2x", data[0], data[1],
-				data[2]);
+		printf(" len=%2u bus=%.2x addr=%.2x%s", data[0], data[1],
+				data[2] >> 1, data[2] & 1 ? "!" : "");
 		dump_data(&data[3], data[0]);
 		return true;
 
@@ -282,6 +288,21 @@ static void handle_bulk(const struct usb_pkt *pkt, uint32_t sec)
 		handle_af9035(sec, pkt->usec, (const void *)pkt->data, in, ep);
 }
 
+static void handle_ctrl(const struct usb_pkt *pkt, uint32_t sec)
+{
+#if 0
+	printf("\t");
+
+	if (!silent)
+		printf("%4u.%.4u", sec, pkt->usec / 100);
+
+	printf(" CTRL");
+	puts("");
+#else
+	(void)pkt; (void)sec;
+#endif
+}
+
 static void handle_single_isoc(const void *isoc_data, uint32_t len)
 {
 	dump_data_limited(isoc_data, len, 20);
@@ -300,8 +321,13 @@ static void handle_isoc(const struct usb_pkt *pkt, uint32_t sec)
 		if (isoc->stat == 0)
 			valid++;
 
-	printf("\t%4u.%.4u ISOC ep=%u %s isoc_nr=%3u (valid=%u)\n",
-			sec, pkt->usec / 100, ep, in ? " IN" : "OUT",
+	printf("\t");
+
+	if (!silent)
+		printf("%4u.%.4u", sec, pkt->usec / 100);
+
+	printf(" ISOC ep=%u %s isoc_nr=%3u (valid=%u)\n",
+			ep, in ? " IN" : "OUT",
 			pkt->isoc_nr, valid);
 
 	if (pkt->type == 'S')
@@ -309,11 +335,13 @@ static void handle_isoc(const struct usb_pkt *pkt, uint32_t sec)
 
 	const void *isoc_data = isoc + pkt->isoc_nr;
 	for (a = 0, (const void *)pkt->data; a < pkt->isoc_nr; a++, isoc++) {
-		printf("\t\tIDESC %2u[%4d/%5u/%4u]", a, isoc->stat, isoc->off,
-		       isoc->len);
+		if (isoc->stat == 0 || !silent)
+			printf("\t\tIDESC %2u[%4d/%5u/%4u]", a, isoc->stat, isoc->off,
+			       isoc->len);
 		if (isoc->stat == 0)
 			handle_single_isoc(isoc_data + isoc->off, isoc->len);
-		puts("");
+		if (isoc->stat == 0 || !silent)
+			puts("");
 	}
 }
 
@@ -350,6 +378,9 @@ static void handle_packet(const struct usb_pkt *pkt)
 	case 0x00:
 		handle_isoc(pkt, pkt->sec - first_sec);
 		break;
+	case 0x02:
+		handle_ctrl(pkt, pkt->sec - first_sec);
+		break;
 	case 0x03:
 		handle_bulk(pkt, pkt->sec - first_sec);
 		break;
@@ -367,7 +398,7 @@ int main(int argc, char **argv)
 
 	int o;
 
-	while ((o = getopt(argc, argv, "dfsv")) != -1) {
+	while ((o = getopt(argc, argv, "dfsvx")) != -1) {
 		switch (o) {
 		case 'd':
 			dump_isoc = open("isoc.raw",
@@ -386,6 +417,9 @@ int main(int argc, char **argv)
 			break;
 		case 'v':
 			verbose = true;
+			break;
+		case 'x':
+			hex_data = true;
 			break;
 		default:
 			errx(1, "bad options");
