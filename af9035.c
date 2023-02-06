@@ -72,6 +72,8 @@
 #define STREAM_BUFS_PER_URB	32
 #define STREAM_BUF_SIZE		3072
 
+#define PACKET_SIZE		184
+
 static const u32 clock_lut_af9035[] = {
 	20480000, /*      FPGA */
 	16384000, /* 16.38 MHz */
@@ -116,10 +118,15 @@ struct af9035 {
 
 	void *stream_bufs[STREAM_BUFS];
 	struct urb *urbs[STREAM_BUFS];
+	bool urbs_submitted[STREAM_BUFS];
 
 	/* List of videobuf2 buffers protected by a lock. */
 	spinlock_t buflock;
 	struct list_head bufs;
+
+	u8 packet_buf[PACKET_SIZE];
+	bool synced;
+	unsigned sequence, vsize, asize;
 };
 
 static int af9035_sleep(struct af9035 *af9035);
@@ -667,26 +674,12 @@ static int af9035_queue_setup(struct vb2_queue *vq,
 			     unsigned int *nplanes, unsigned int sizes[],
 			     struct device *alloc_devs[])
 {
-	struct af9035 *af9035 = vb2_get_drv_priv(vq);
-#if 1
-	dev_info(&af9035->intf->dev, "%s: just guessing\n", __func__);
 	*nbuffers = 2;
 	*nplanes = 1;
-	sizes[0] = 720*576*3;
+	/* half-size (interlacing) of 16bit (UYVY) 720x576 picture */
+	sizes[0] = 720*576*2/2;
 
 	return 0;
-#else
-	unsigned size = USBTV_CHUNK * af9035->n_chunks * 2 * sizeof(u32);
-
-	if (vq->num_buffers + *nbuffers < 2)
-		*nbuffers = 2 - vq->num_buffers;
-	if (*nplanes)
-		return sizes[0] < size ? -EINVAL : 0;
-	*nplanes = 1;
-	sizes[0] = size;
-
-	return 0;
-#endif
 }
 
 static void af9035_buf_queue(struct vb2_buffer *vb)
@@ -726,8 +719,12 @@ static void af9035_reclaim_buffers(struct af9035 *af9035,
 static void af9035_kill_urbs(struct af9035 *af9035)
 {
         for (unsigned i = 0; i < STREAM_BUFS; i++) {
-                dev_dbg(&af9035->intf->dev, "%s: kill urb=%d\n", __func__, i);
+		if (!af9035->urbs_submitted[i])
+			continue;
+                dev_dbg(&af9035->intf->dev, "%s: kill urb=%2d/%p\n", __func__,
+			i, af9035->urbs[i]);
                 usb_kill_urb(af9035->urbs[i]);
+		af9035->urbs_submitted[i] = false;
         }
 }
 
@@ -736,7 +733,8 @@ static int af9035_submit_urbs(struct af9035 *af9035)
 	int ret;
 
         for (unsigned i = 0; i < STREAM_BUFS; i++) {
-                dev_dbg(&af9035->intf->dev, "%s: submit urb=%d\n", __func__, i);
+                dev_dbg(&af9035->intf->dev, "%s: submit urb=%2d/%p\n", __func__,
+			i, af9035->urbs[i]);
                 ret = usb_submit_urb(af9035->urbs[i], GFP_KERNEL);
                 if (ret) {
                         dev_err(&af9035->intf->dev,
@@ -745,6 +743,7 @@ static int af9035_submit_urbs(struct af9035 *af9035)
                         af9035_kill_urbs(af9035);
                         return ret;
                 }
+		af9035->urbs_submitted[i] = true;
         }
 
 	return 0;
@@ -754,6 +753,11 @@ static int af9035_start_streaming(struct vb2_queue *vq, unsigned int count)
 {
 	struct af9035 *af9035 = vb2_get_drv_priv(vq);
 	int ret;
+
+	af9035->synced = false;
+	af9035->sequence = 0;
+	af9035->vsize = 0;
+	af9035->asize = 0;
 
 	if (af9035->intf == NULL) {
 		ret = -ENODEV;
@@ -975,17 +979,227 @@ static void af9035_video_free(struct af9035 *af9035)
 	v4l2_device_put(&af9035->v4l2_dev);
 }
 
+/* =========================== FRAME decode =========================== */
+
+struct header {
+	union {
+		struct {
+			uint8_t FA;
+			/*
+			 * 4 bits: type
+			 * 4 bits: seq_bot
+			 * 5 bits: seq_top
+			 * 3 bits: ???
+			 * 1 bit: FINAL
+			 * 1 bit: SPEC
+			 * 1 bit: AUDIO
+			 * 1 bit: REAL
+			 * 4 bits: synch
+			 */
+			uint8_t type_seq;
+			uint8_t seq_res;
+			uint8_t res_stream;
+		};
+		uint32_t val;
+	};
+} __attribute__((packed));
+
+#define HEADER_FA(hdr)		(((hdr)->val & 0xff000000) >> 24)
+#define HEADER_WORDS(hdr)	(((hdr)->val & 0x00f00000) >> 20)
+#define HEADER_SEQ_BOT(hdr)	(((hdr)->val & 0x000f0000) >> 16)
+#define  HEADER_SEQ_BOT_BITS	4
+#define HEADER_SEQ_TOP(hdr)	(((hdr)->val & 0x0000f800) >> 11)
+#define HEADER_FLIP(hdr)	(((hdr)->val & 0x00000400) >> 10)
+#define HEADER_HISIZE(hdr)	(((hdr)->val & 0x00000300) >>  8)
+#define HEADER_REAL(hdr)	(((hdr)->val & 0x00000080) >>  7)
+#define HEADER_AUDIO(hdr)	(((hdr)->val & 0x00000040) >>  6)
+#define HEADER_SYNC(hdr)	(((hdr)->val & 0x00000020) >>  5)
+#define HEADER_unk1(hdr)	(((hdr)->val & 0x00000010) >>  4)
+#define HEADER_XXX_MASK(hdr)	(((hdr)->val & 0x000000f0) >>  4)
+#define HEADER_SY(hdr)		(((hdr)->val & 0x0000000f) >>  0)
+
+static inline uint16_t HEADER_SEQ(const struct header *hdr)
+{
+	uint16_t seq = HEADER_SEQ_TOP(hdr);
+
+	seq <<= HEADER_SEQ_BOT_BITS;
+	seq |= HEADER_SEQ_BOT(hdr);
+
+	WARN_ON(seq & 1);
+
+	return seq >> 1;
+}
+
+static inline unsigned HEADER_SIZE(const struct header *hdr)
+{
+	return (HEADER_HISIZE(hdr) << 6) | (HEADER_WORDS(hdr) << 2);
+}
+
+static int maincoon(struct af9035 *af9035)
+{
+	struct header header;
+	ssize_t to_read;
+
+	while (1) {
+		bool dump_video = false;
+		ssize_t rd = read((void *)&header, sizeof(header));
+		if (!rd)
+			break;
+
+		if (rd != sizeof(header)) {
+			dev_warn(&af9035->intf->dev, "read(header)\n");
+			return -EIO;
+		}
+
+		if (header.FA != 0xfa) {
+			dev_dbg(&af9035->intf->dev, " BAD(%.8x)\n",
+					be32_to_cpu(header.val));
+			continue;
+		}
+
+retry:
+		header.val = be32_to_cpu(header.val);
+
+		to_read = HEADER_SIZE(&header);
+		dev_dbg(&af9035->intf->dev,
+				"hdr=%.8x SEQ=%3u/%2x SY=%u %c%c%c%c%c len=%3zd",
+		       header.val,
+		       HEADER_SEQ(&header), HEADER_SEQ(&header),
+		       HEADER_SY(&header),
+		       HEADER_FLIP(&header) ? 'F' : '_',
+		       HEADER_REAL(&header) ? 'R' : '_',
+		       HEADER_AUDIO(&header) ? 'A' : '_',
+		       HEADER_SYNC(&header) ? 'S' : '_',
+		       HEADER_unk1(&header) ? 'U' : '_',
+		       to_read);
+
+		if (to_read) {
+			rd = read(&af9035->packet_buf, to_read);
+			if (rd < 0) {
+				dev_warn(&af9035->intf->dev,
+					 "read(data) at 0xx");
+				return -EIO;
+			}
+			if (rd != to_read)
+				break;
+
+			/* BUG in FW? */
+			if (to_read == 4 && af9035->packet_buf[0] == 0xfa) {
+				pr_cont(" BAD -- retrying\n");
+				memcpy(&header, af9035->packet_buf,
+				       sizeof(header));
+				goto retry;
+			}
+
+			if (HEADER_unk1(&header)) {
+				pr_cont(" U");
+			} else if (HEADER_SYNC(&header)) {
+				pr_cont(" S");
+				dump_video = true;
+				if (!af9035->synced) {
+					af9035->asize = 0;
+					af9035->vsize = 0;
+				}
+				af9035->synced = true;
+			} else if (HEADER_AUDIO(&header)) {
+				pr_cont(" A");
+#if 0
+				if (synced && audio_fd >= 0)
+					write(audio_fd, buf, rd);
+				asize += rd;
+#endif
+			} else if (to_read == 180) {
+				pr_cont(" V");
+#if 0
+				if (af9035->synced &&
+				    af9035->vsize + (size_t)rd < sizeof(videobuf))
+					memcpy(&videobuf[af9035->vsize],
+					       &af9035->packet_buf[4], rd);
+#endif
+				af9035->vsize += rd;
+			} else
+				pr_cont(" _");
+
+			pr_cont(" vsize=%6u asize=%8u", af9035->vsize,
+				 af9035->asize);
+			//dump_data_limited("payl", buf, rd, 12);
+		}
+
+		pr_cont("\n");
+
+#if 0
+		if (dump_video && vsize) {
+			if (synced && video_fd >= 0) {
+				printf("dumping; ");
+				write(video_fd, videobuf, sizeof(videobuf));
+				memset(videobuf, 0, sizeof(videobuf));
+			}
+			printf("vsize=%u\n", vsize);
+			vsize = 0;
+		}
+#endif
+	}
+
+	pr_cont("\n");
+
+	return 0;
+}
+
+static bool af9035_output_to_frame(struct af9035 *af9035, void *frame,
+				   const u8 *data, unsigned len)
+{
+	maincoon(af9035);
+	return false;
+}
+
 /* =========================== DEV =========================== */
 
 static void af9035_complete(struct af9035 *af9035, const u8 *data, unsigned len)
 {
-	WARN_ONCE(1, "unimplemented");
+	struct af9035_buf *buf;
+	unsigned long flags;
+	void *frame;
+
+	//print_hex_dump_bytes("pkt: ", DUMP_PREFIX_NONE, data, min(len, 16U));
+
+        spin_lock_irqsave(&af9035->buflock, flags);
+
+        if (list_empty(&af9035->bufs)) {
+                /* No free buffers. Userspace likely too slow. */
+                spin_unlock_irqrestore(&af9035->buflock, flags);
+                return;
+        }
+
+        /* First available buffer. */
+        buf = list_first_entry(&af9035->bufs, struct af9035_buf, list);
+        frame = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+
+	if (af9035_output_to_frame(af9035, frame, data, len)) {
+		int size = vb2_plane_size(&buf->vb.vb2_buf, 0);
+
+		buf->vb.field = V4L2_FIELD_SEQ_BT;
+		buf->vb.sequence = af9035->sequence++;
+		buf->vb.vb2_buf.timestamp = ktime_get_ns();
+		vb2_set_plane_payload(&buf->vb.vb2_buf, 0, size);
+		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+		list_del(&buf->list);
+	}
+
+        spin_unlock_irqrestore(&af9035->buflock, flags);
 }
 
 static void usb_urb_complete(struct urb *urb)
 {
         struct af9035 *af9035 = urb->context;
+	int ret;
 	u8 *b;
+
+/*	dev_dbg(&af9035->intf->dev, "%s: %s urb (%p) completion status=%d length=%d/%d pack_num=%d errors=%d\n",
+		__func__,
+		usb_pipetype(urb->pipe) == PIPE_ISOCHRONOUS ? "isoc" : "bulk",
+		urb, urb->status, urb->actual_length,
+		urb->transfer_buffer_length, urb->number_of_packets,
+		urb->error_count);*/
 
 	switch (urb->status) {
 	case 0:			/* success */
@@ -1002,19 +1216,21 @@ static void usb_urb_complete(struct urb *urb)
 		break;
 	}
 
-	dev_dbg_ratelimited(&af9035->intf->dev,
-			"%s: urb completion status=%d\n",
-			__func__, urb->status);
-
 	b = (u8 *)urb->transfer_buffer;
 	switch (usb_pipetype(urb->pipe)) {
 	case PIPE_ISOCHRONOUS:
 		for (unsigned i = 0; i < urb->number_of_packets; i++) {
+			/*dev_dbg(&af9035->intf->dev,
+				"%s: iso frame descriptor %u state=%d len=%d\n",
+				__func__,
+				i, urb->iso_frame_desc[i].status,
+				urb->iso_frame_desc[i].actual_length);*/
 			if (urb->iso_frame_desc[i].status != 0)
-				dev_dbg(&af9035->intf->dev,
-					"%s: iso frame descriptor has an error=%d\n",
-					__func__,
-					urb->iso_frame_desc[i].status);
+				/*dev_dbg(&af9035->intf->dev,
+					"%s: iso frame descriptor %u has an error=%d\n",
+					__func__, i,
+					urb->iso_frame_desc[i].status);*/
+				;
 			else if (urb->iso_frame_desc[i].actual_length > 0)
 				af9035_complete(af9035,
 						b + urb->iso_frame_desc[i].offset,
@@ -1030,7 +1246,11 @@ static void usb_urb_complete(struct urb *urb)
 		return;
 	}
 
-	usb_submit_urb(urb, GFP_ATOMIC);
+	ret = usb_submit_urb(urb, GFP_ATOMIC);
+	if (ret)
+		dev_dbg(&af9035->intf->dev, "%s: usb_submit_urb() failed=%d\n",
+			__func__, ret);
+	//dev_dbg(&af9035->intf->dev, "%s: urb (%p) submitted\n", __func__, urb);
 }
 
 static int af9035_load_fw(struct af9035 *af9035)
@@ -1092,9 +1312,9 @@ static int af9035_stream_init(struct af9035 *af9035)
 		urb->transfer_buffer = af9035->stream_bufs[i];
 
 		ep = usb_pipe_endpoint(udev, urb->pipe);
-		dev_dbg(&af9035->intf->dev, "urb pipe=%.8x maxp=%d isoc=%d\n",
+		/*dev_dbg(&af9035->intf->dev, "urb pipe=%.8x maxp=%d isoc=%d\n",
 			urb->pipe, usb_endpoint_maxp(&ep->desc),
-			usb_endpoint_xfer_isoc(&ep->desc));
+			usb_endpoint_xfer_isoc(&ep->desc));*/
 
 		for (unsigned j = 0; j < STREAM_BUFS_PER_URB; j++) {
 			urb->iso_frame_desc[j].offset = STREAM_BUF_SIZE * j;
@@ -1232,12 +1452,12 @@ static int af9035_probe(struct usb_interface *intf,
 			return ret;
 		}
 
+		dev_info(&intf->dev, "%s: altset=%u\n", __func__,
+			 intf->cur_altsetting->desc.bAlternateSetting);
+
 		/* the device needs to set up itself after set_interface */
 		msleep(250);
 	}
-
-	dev_info(&intf->dev, "%s: altset=%u\n", __func__,
-		 intf->cur_altsetting->desc.bAlternateSetting);
 
 	af9035 = kzalloc(sizeof(*af9035), GFP_KERNEL);
 	if (!af9035)
