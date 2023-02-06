@@ -158,8 +158,8 @@ static int af9035_rw(struct af9035 *af9035, u8 *wbuf, u16 wlen,
 				   rbuf, rlen, &actual_length, 2000);
                 if (ret)
                         dev_err(&udev->dev,
-                                        "%s: 2nd usb_bulk_msg() failed=%d\n",
-                                        KBUILD_MODNAME, ret);
+                                        "%s: usb_bulk_msg() failed=%d\n",
+                                        __func__, ret);
 
                 /*dev_dbg(&udev->dev, "%s: <<< %*ph\n", __func__,
                                 actual_length, rbuf);*/
@@ -377,7 +377,11 @@ static int af9035_write_blob(struct af9035 *af9035,
 					    blob[i].addr, blob[i].data,
 					    blob[i].len);
 			if (ret) {
-				if (af9035->buf[2] != blob[i].sta) {
+				if (af9035->buf[2] == blob[i].sta) {
+					dev_dbg(&af9035->intf->dev,
+						"%uth blob [%.2x:%.2x] EXPECTEDLY failed\n",
+						i, blob[i].bus, blob[i].addr);
+				} else {
 					dev_err(&af9035->intf->dev,
 						"%uth blob failed\n", i);
 					return ret;
@@ -405,6 +409,9 @@ static int af9035_identify_state(struct af9035 *state)
 
 	state->chip_version = rbuf[0];
 	state->chip_type = rbuf[2] << 8 | rbuf[1] << 0;
+
+	dev_dbg(&intf->dev, "chip_version=%02x chip_type=%04x\n",
+		state->chip_version, state->chip_type);
 
 	ret = af9035_rd_reg(state, 0x384f, &state->prechip_version);
 	if (ret < 0)
@@ -445,7 +452,7 @@ static int af9035_identify_state(struct af9035 *state)
 	return ret;
 
 err:
-	dev_dbg(&intf->dev, "failed=%d\n", ret);
+	dev_dbg(&intf->dev, "%s: failed=%d\n", __func__, ret);
 
 	return ret;
 }
@@ -576,7 +583,7 @@ static int af9035_download_firmware(struct af9035 *state,
 	return 0;
 
 err:
-	dev_dbg(&intf->dev, "failed=%d\n", ret);
+	dev_dbg(&intf->dev, "%s: failed=%d\n", __func__, ret);
 
 	return ret;
 }
@@ -643,7 +650,7 @@ static int af9035_read_config(struct af9035 *state)
 	return 0;
 
 err:
-	dev_dbg(&intf->dev, "failed=%d\n", ret);
+	dev_dbg(&intf->dev, "%s: failed=%d\n", __func__, ret);
 
 	return ret;
 }
@@ -730,7 +737,7 @@ static int af9035_submit_urbs(struct af9035 *af9035)
 
         for (unsigned i = 0; i < STREAM_BUFS; i++) {
                 dev_dbg(&af9035->intf->dev, "%s: submit urb=%d\n", __func__, i);
-                ret = usb_submit_urb(af9035->urbs[i], GFP_ATOMIC);
+                ret = usb_submit_urb(af9035->urbs[i], GFP_KERNEL);
                 if (ret) {
                         dev_err(&af9035->intf->dev,
                                         "%s: could not submit urb no. %d - get them all back\n",
@@ -995,6 +1002,10 @@ static void usb_urb_complete(struct urb *urb)
 		break;
 	}
 
+	dev_dbg_ratelimited(&af9035->intf->dev,
+			"%s: urb completion status=%d\n",
+			__func__, urb->status);
+
 	b = (u8 *)urb->transfer_buffer;
 	switch (usb_pipetype(urb->pipe)) {
 	case PIPE_ISOCHRONOUS:
@@ -1072,7 +1083,7 @@ static int af9035_stream_init(struct af9035 *af9035)
 		urb->dev = udev;
 		urb->context = af9035;
 		urb->complete = usb_urb_complete;
-		urb->pipe = usb_rcvisocpipe(udev, 0x86);
+		urb->pipe = usb_rcvisocpipe(udev, 0x6);
 		urb->transfer_flags = URB_ISO_ASAP;
 		urb->interval = 1;
 		urb->number_of_packets = STREAM_BUFS_PER_URB;
@@ -1081,8 +1092,9 @@ static int af9035_stream_init(struct af9035 *af9035)
 		urb->transfer_buffer = af9035->stream_bufs[i];
 
 		ep = usb_pipe_endpoint(udev, urb->pipe);
-		dev_dbg(&af9035->intf->dev, "urb pipe=%.8x maxp=%d\n",
-			urb->pipe, usb_endpoint_maxp(&ep->desc));
+		dev_dbg(&af9035->intf->dev, "urb pipe=%.8x maxp=%d isoc=%d\n",
+			urb->pipe, usb_endpoint_maxp(&ep->desc),
+			usb_endpoint_xfer_isoc(&ep->desc));
 
 		for (unsigned j = 0; j < STREAM_BUFS_PER_URB; j++) {
 			urb->iso_frame_desc[j].offset = STREAM_BUF_SIZE * j;
@@ -1151,8 +1163,14 @@ static int af9035_frontend_init(struct af9035 *af9035)
 
 	/* likely unneeded as it (expectedly) fails */
 	ret = af9035_wr_i2c(af9035, 0, 0x02, 0xc2, wbuf, sizeof(wbuf));
-	if (!ret || af9035->buf[2] != 4)
-		return ret;
+	if (!ret)
+		return -EIO;
+
+	if (af9035->buf[2] == 4)
+		dev_dbg(&af9035->intf->dev,
+				"write to 02:c2 EXPECTEDLY failed\n");
+	else
+		return -EIO;
 
 	return af9035_sleep(af9035);
 }
@@ -1202,18 +1220,24 @@ static int af9035_probe(struct usb_interface *intf,
 	struct af9035 *af9035;
 	int ret;
 
-#if 0
-	ret = usb_set_interface(interface_to_usbdev(intf), 0, 1);
-	if (ret) {
-		dev_info(&intf->dev, "%s: cannot set altset to 1\n", __func__);
-		return ret;
+	dev_info(&intf->dev, "%s: altset=%u\n", __func__,
+		 intf->cur_altsetting->desc.bAlternateSetting);
+
+	if (intf->cur_altsetting->desc.bAlternateSetting != 1) {
+		dev_dbg(&intf->dev, "switching to altset 1\n");
+		ret = usb_set_interface(interface_to_usbdev(intf), 0, 1);
+		if (ret) {
+			dev_info(&intf->dev, "%s: cannot set altset to 1\n",
+				 __func__);
+			return ret;
+		}
+
+		/* the device needs to set up itself after set_interface */
+		msleep(250);
 	}
 
-	msleep(200);
-#endif
-
-	dev_info(&intf->dev, "%s: altset=%zu\n", __func__,
-		 intf->cur_altsetting - intf->altsetting);
+	dev_info(&intf->dev, "%s: altset=%u\n", __func__,
+		 intf->cur_altsetting->desc.bAlternateSetting);
 
 	af9035 = kzalloc(sizeof(*af9035), GFP_KERNEL);
 	if (!af9035)
