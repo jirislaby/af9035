@@ -16,8 +16,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall")
 set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -Wextra -ggdb")
 
-add_executable(pkt pkt.c)
-add_executable(demux demux.c)
+add_executable(pkt pkt.c demux.c)
 add_executable(pcm pcm.c)
 
 find_package(PkgConfig REQUIRED)

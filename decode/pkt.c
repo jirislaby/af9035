@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +12,8 @@
 #include <unistd.h>
 
 #include <pcap/pcap.h>
+
+#include "common.h"
 
 struct usb_pkt {
 	uint64_t id;
@@ -97,17 +100,20 @@ static const struct {
 
 static int dump_isoc = -1, dump_fw = -1;
 static bool verbose, silent, hex_data;
+unsigned pkt_lim = UINT_MAX;
+int video_fd = -1, audio_fd = -1;
 
-static void dump_data(const uint8_t *data, unsigned len)
+void dump_data(const char *prefix, const uint8_t *data, unsigned len)
 {
-	printf(" data=");
+	printf(" %s=", prefix);
 	for (unsigned a = 0; a < len; a++)
 		printf("%s%.2x", hex_data ? ", 0x" : " ", data[a]);
 }
 
-static void dump_data_limited(const uint8_t *data, unsigned len, unsigned limit)
+void dump_data_limited(const char *prefix, const uint8_t *data, unsigned len,
+		       unsigned limit)
 {
-	dump_data(data, min(len, limit));
+	dump_data(prefix, data, min(len, limit));
 	if (len > limit)
 		printf(" (%u more)", len - limit);
 }
@@ -206,7 +212,7 @@ static bool handle_wr_cmd(const struct af9035 *af, const uint8_t *data,
 		uint32_t reg = get_reg(af->wr.mbox, &data[4]);
 		printf(" len=%2u reg=%.6x/%-20s", data[0], reg,
 		       get_reg_name(reg));
-		dump_data(&data[6], data[0]);
+		dump_data("data", &data[6], data[0]);
 		return true;
 	}
 	case CMD_GENERIC_I2C_RD:
@@ -216,7 +222,7 @@ static bool handle_wr_cmd(const struct af9035 *af, const uint8_t *data,
 	case CMD_GENERIC_I2C_WR:
 		printf(" len=%2u bus=%.2x addr=%.2x%s", data[0], data[1],
 				data[2] >> 1, data[2] & 1 ? "!" : "");
-		dump_data(&data[3], data[0]);
+		dump_data("data", &data[3], data[0]);
 		return true;
 
 	case CMD_FW_QUERYINFO:
@@ -225,7 +231,7 @@ static bool handle_wr_cmd(const struct af9035 *af, const uint8_t *data,
 
 	case CMD_FW_DL:
 		printf(" len=%u", data_len);
-		dump_data_limited(data, data_len, 20);
+		dump_data_limited("data", data, data_len, 20);
 		if (dump_fw >= 0)
 			write(dump_fw, data, data_len);
 		return true;
@@ -274,7 +280,7 @@ static void handle_af9035(uint32_t sec, uint32_t usec, const struct af9035 *af,
 	}
 
 	if (do_dump_data)
-		dump_data(&raw[start], af->len - 1 - start);
+		dump_data("data", &raw[start], af->len - 1 - start);
 
 	puts("");
 }
@@ -303,9 +309,10 @@ static void handle_ctrl(const struct usb_pkt *pkt, uint32_t sec)
 #endif
 }
 
-static void handle_single_isoc(const void *isoc_data, uint32_t len)
+static void handle_single_isoc(const uint8_t *isoc_data, uint32_t len)
 {
-	dump_data_limited(isoc_data, len, 20);
+	dump_data_limited("data", isoc_data, len, 20);
+	demux(isoc_data, len);
 	if (dump_isoc >= 0)
 		write(dump_isoc, isoc_data, len);
 }
@@ -370,7 +377,7 @@ static void handle_packet(const struct usb_pkt *pkt)
 
 	if (verbose) {
 		printf("%c ttype=%s, dlen=%3u", pkt->type, get_ttype(pkt), pkt->dlen);
-		dump_data_limited(pkt->data, pkt->dlen, 30);
+		dump_data_limited("data", pkt->data, pkt->dlen, 30);
 		puts("");
 	}
 
@@ -398,8 +405,12 @@ int main(int argc, char **argv)
 
 	int o;
 
-	while ((o = getopt(argc, argv, "dfsvx")) != -1) {
+	while ((o = getopt(argc, argv, "adfl:svVx")) != -1) {
 		switch (o) {
+		case 'a':
+			audio_fd = open("audio.raw", O_WRONLY | O_CREAT |
+					O_TRUNC, 0644);
+			break;
 		case 'd':
 			dump_isoc = open("isoc.raw",
 					 O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -412,11 +423,18 @@ int main(int argc, char **argv)
 			if (dump_fw < 0)
 				err(1, "open(fw.raw)");
 			break;
+		case 'l':
+			pkt_lim = atol(optarg);
+			break;
 		case 's':
 			silent = true;
 			break;
 		case 'v':
 			verbose = true;
+			break;
+		case 'V':
+			video_fd = open("video.raw", O_WRONLY | O_CREAT |
+					O_TRUNC, 0644);
 			break;
 		case 'x':
 			hex_data = true;
@@ -442,6 +460,8 @@ int main(int argc, char **argv)
 	pcap_close(pcap);
 	close(dump_isoc);
 	close(dump_fw);
+	close(audio_fd);
+	close(video_fd);
 
 	return 0;
 }

@@ -1,7 +1,6 @@
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -11,23 +10,7 @@
 
 #include <arpa/inet.h>
 
-#define min(a, b)	((a) < (b) ? (a) : (b))
-
-static void dump_data(const char *prefix, const uint8_t *data, unsigned len)
-{
-	printf(" %s=", prefix);
-	for (unsigned a = 0; a < len; a++)
-		printf(" %.2x", data[a]);
-}
-
-static void dump_data_limited(const char *prefix, const uint8_t *data,
-			      unsigned len, unsigned limit)
-{
-	dump_data(prefix, data, min(len, limit));
-	if (len > limit)
-		printf(" (%u more)", len - limit);
-}
-
+#include "common.h"
 
 struct header {
 	union {
@@ -85,39 +68,18 @@ static inline unsigned HEADER_SIZE(const struct header *hdr)
 	return (HEADER_HISIZE(hdr) << 6) | (HEADER_WORDS(hdr) << 2);
 }
 
-int main(int argc, char **argv)
+void demux(const uint8_t *isoc_data, uint32_t len)
 {
 	struct header header;
 	uint8_t buf[184 - sizeof(header)], videobuf[720*576/2*2];
-	unsigned int pkt = 0, pkt_lim = UINT_MAX;
+	unsigned int pkt = 0;
 	ssize_t rd, to_read;
 	size_t off = 0;
 	unsigned vsize = 0, asize = 0, ssize = 0;
 	bool synced = false;
-	int o, video_fd = -1, audio_fd = -1, in_fd = STDIN_FILENO;
+	int in_fd = STDIN_FILENO;
 
 	memset(videobuf, 0, sizeof(videobuf));
-
-	while ((o = getopt(argc, argv, "ai:l:v")) != -1) {
-		switch (o) {
-		case 'a':
-			audio_fd = open("audio.raw", O_WRONLY | O_CREAT |
-					O_TRUNC, 0644);
-			break;
-		case 'v':
-			video_fd = open("video.raw", O_WRONLY | O_CREAT |
-					O_TRUNC, 0644);
-			break;
-		case 'i':
-			in_fd = open(optarg, O_RDONLY);
-			if (in_fd < 0)
-				err(1, "open(%s)", optarg);
-			break;
-		case 'l':
-			pkt_lim = atol(optarg);
-			break;
-		}
-	}
 
 	while (1) {
 		printf("off=%8zx", off);
@@ -221,10 +183,5 @@ retry:
 	}
 
 	puts("");
-
-	close(audio_fd);
-	close(video_fd);
-
-	return 0;
 }
 
