@@ -45,7 +45,7 @@ struct isoc_desc {
 	uint32_t pad;
 } __attribute__((packed));
 
-struct af9035 {
+struct af9035_hw {
 	uint8_t len;
 	union {
 		struct {
@@ -61,9 +61,6 @@ struct af9035 {
 		} rd;
 	};
 } __attribute__((packed));
-
-#define ARRAY_SIZE(x)	(sizeof(x) / sizeof(*(x)))
-#define min(a, b)	((a) < (b) ? (a) : (b))
 
 #define CMD_MEM_RD                  0x00
 #define CMD_MEM_WR                  0x01
@@ -100,7 +97,6 @@ static const struct {
 
 static int dump_isoc = -1, dump_fw = -1;
 static bool verbose, silent, hex_data;
-unsigned pkt_lim = UINT_MAX;
 int video_fd = -1, audio_fd = -1;
 
 void dump_data(const char *prefix, const uint8_t *data, unsigned len)
@@ -198,7 +194,7 @@ static inline uint32_t get_reg(uint8_t mbox, const uint8_t reg_arr[static 2])
 	return reg;
 }
 
-static bool handle_wr_cmd(const struct af9035 *af, const uint8_t *data,
+static bool handle_wr_cmd(const struct af9035_hw *af, const uint8_t *data,
 		unsigned data_len)
 {
 	switch (af->wr.cmd) {
@@ -244,7 +240,8 @@ static bool handle_wr_cmd(const struct af9035 *af, const uint8_t *data,
 	return false;
 }
 
-static void handle_af9035(uint32_t sec, uint32_t usec, const struct af9035 *af,
+static void handle_af9035(uint32_t sec, uint32_t usec,
+			  const struct af9035_hw *af,
 			  bool in, uint8_t ep)
 {
 	const uint8_t *raw = (const void *)af;
@@ -309,15 +306,17 @@ static void handle_ctrl(const struct usb_pkt *pkt, uint32_t sec)
 #endif
 }
 
-static void handle_single_isoc(const uint8_t *isoc_data, uint32_t len)
+static void handle_single_isoc(struct af9035 *af9035, const uint8_t *isoc_data,
+			       uint32_t len)
 {
 	dump_data_limited("data", isoc_data, len, 20);
-	demux(isoc_data, len);
+	demux(af9035, isoc_data, len);
 	if (dump_isoc >= 0)
 		write(dump_isoc, isoc_data, len);
 }
 
-static void handle_isoc(const struct usb_pkt *pkt, uint32_t sec)
+static void handle_isoc(struct af9035 *af9035, const struct usb_pkt *pkt,
+			uint32_t sec)
 {
 	const struct isoc_desc *isoc;
 	bool in = pkt->ep_dir & (1U << 7);
@@ -346,7 +345,8 @@ static void handle_isoc(const struct usb_pkt *pkt, uint32_t sec)
 			printf("\t\tIDESC %2u[%4d/%5u/%4u]", a, isoc->stat, isoc->off,
 			       isoc->len);
 		if (isoc->stat == 0)
-			handle_single_isoc(isoc_data + isoc->off, isoc->len);
+			handle_single_isoc(af9035, isoc_data + isoc->off,
+					   isoc->len);
 		if (isoc->stat == 0 || !silent)
 			puts("");
 	}
@@ -368,7 +368,7 @@ static const char *get_ttype(const struct usb_pkt *pkt)
 	}
 }
 
-static void handle_packet(const struct usb_pkt *pkt)
+static void handle_packet(struct af9035 *af9035, const struct usb_pkt *pkt)
 {
 	static uint64_t first_sec;
 
@@ -383,7 +383,7 @@ static void handle_packet(const struct usb_pkt *pkt)
 
 	switch (pkt->ttype) {
 	case 0x00:
-		handle_isoc(pkt, pkt->sec - first_sec);
+		handle_isoc(af9035, pkt, pkt->sec - first_sec);
 		break;
 	case 0x02:
 		handle_ctrl(pkt, pkt->sec - first_sec);
@@ -394,9 +394,10 @@ static void handle_packet(const struct usb_pkt *pkt)
 	}
 }
 
-static void pcap_cb(u_char *, const struct pcap_pkthdr *, const u_char *bytes)
+static void pcap_cb(u_char *af9035, const struct pcap_pkthdr *,
+		    const u_char *bytes)
 {
-	handle_packet((const void *)bytes);
+	handle_packet((void *)af9035, (const void *)bytes);
 }
 
 int main(int argc, char **argv)
@@ -405,7 +406,7 @@ int main(int argc, char **argv)
 
 	int o;
 
-	while ((o = getopt(argc, argv, "adfl:svVx")) != -1) {
+	while ((o = getopt(argc, argv, "adfsvVx")) != -1) {
 		switch (o) {
 		case 'a':
 			audio_fd = open("audio.raw", O_WRONLY | O_CREAT |
@@ -422,9 +423,6 @@ int main(int argc, char **argv)
 				       O_WRONLY | O_CREAT | O_TRUNC, 0644);
 			if (dump_fw < 0)
 				err(1, "open(fw.raw)");
-			break;
-		case 'l':
-			pkt_lim = atol(optarg);
 			break;
 		case 's':
 			silent = true;
@@ -445,6 +443,7 @@ int main(int argc, char **argv)
 	}
 
 	char errbuf[PCAP_ERRBUF_SIZE];
+	struct af9035 af9035 = {};
 
 	if (pcap_init(0, errbuf) < 0)
 		errx(1, "pcap_init: %s", errbuf);
@@ -453,7 +452,7 @@ int main(int argc, char **argv)
 	if (!pcap)
 		errx(1, "pcap_open_offline: %s", errbuf);
 
-	if (pcap_loop(pcap, -1, pcap_cb, NULL) == PCAP_ERROR)
+	if (pcap_loop(pcap, -1, pcap_cb, (void *)&af9035) == PCAP_ERROR)
 		errx(1, "pcap_loop: %s", pcap_geterr(pcap));
 
 

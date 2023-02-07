@@ -12,30 +12,32 @@
 
 #include "common.h"
 
-struct header {
+#define be32_to_cpu(x)	ntohl(x)
+#define pr_cont		printf
+
+struct af9035_packet {
 	union {
 		struct {
 			uint8_t FA;
 			/*
-			 * 4 bits: type
+			 * 4 bits: size_bot
 			 * 4 bits: seq_bot
 			 * 5 bits: seq_top
-			 * 3 bits: ???
-			 * 1 bit: FINAL
-			 * 1 bit: SPEC
-			 * 1 bit: AUDIO
+			 * 1 bits: FLIP
+			 * 2 bits: size_top
 			 * 1 bit: REAL
+			 * 1 bit: AUDIO
+			 * 1 bit: SYNC
+			 * 1 bit: ??
 			 * 4 bits: synch
 			 */
-			uint8_t type_seq;
-			uint8_t seq_res;
-			uint8_t res_stream;
+			uint8_t res[3];
 		};
 		uint32_t val;
 	};
+	uint8_t data[];
 } __attribute__((packed));
 
-#define PACKET_SIZE		184
 #define HEADER_FA(hdr)		(((hdr)->val & 0xff000000) >> 24)
 #define HEADER_WORDS(hdr)	(((hdr)->val & 0x00f00000) >> 20)
 #define HEADER_SEQ_BOT(hdr)	(((hdr)->val & 0x000f0000) >> 16)
@@ -50,7 +52,7 @@ struct header {
 #define HEADER_XXX_MASK(hdr)	(((hdr)->val & 0x000000f0) >>  4)
 #define HEADER_SY(hdr)		(((hdr)->val & 0x0000000f) >>  0)
 
-static inline uint16_t HEADER_SEQ(const struct header *hdr)
+static inline uint16_t HEADER_SEQ(const struct af9035_packet *hdr)
 {
 	uint16_t seq = HEADER_SEQ_TOP(hdr);
 
@@ -63,125 +65,118 @@ static inline uint16_t HEADER_SEQ(const struct header *hdr)
 	return seq >> 1;
 }
 
-static inline unsigned HEADER_SIZE(const struct header *hdr)
+static inline unsigned HEADER_SIZE(const struct af9035_packet *hdr)
 {
 	return (HEADER_HISIZE(hdr) << 6) | (HEADER_WORDS(hdr) << 2);
 }
 
-void demux(const uint8_t *isoc_data, uint32_t len)
+static void *get_data(struct af9035 *af9035, const uint8_t **isoc_data,
+		      uint32_t *len, unsigned requested)
 {
-	struct header header;
-	uint8_t buf[184 - sizeof(header)], videobuf[720*576/2*2];
-	unsigned int pkt = 0;
-	ssize_t rd, to_read;
-	size_t off = 0;
-	unsigned vsize = 0, asize = 0, ssize = 0;
-	bool synced = false;
-	int in_fd = STDIN_FILENO;
+	unsigned to_copy;
 
-	memset(videobuf, 0, sizeof(videobuf));
+	if (af9035->packet_buf_ptr >= requested) {
+		return af9035->packet_buf;
+	} else if (af9035->packet_buf_ptr) {
+		to_copy = min(requested, *len);
+		memcpy(af9035->packet_buf + af9035->packet_buf_ptr, *isoc_data,
+		       to_copy);
+		af9035->off += to_copy;
+		af9035->packet_buf_ptr = 0;
 
-	while (1) {
-		printf("off=%8zx", off);
-		rd = read(in_fd, (void *)&header, sizeof(header));
-		if (!rd)
-			break;
+		*len -= to_copy;
+		*isoc_data += to_copy;
 
-		if (rd != sizeof(header)) {
-			puts("");
-			fflush(stdout);
-			err(1, "read(header)");
-		}
-
-		off += rd;
-
-		if (header.FA != 0xfa) {
-			printf(" BAD(%.8x)\n", ntohl(header.val));
-			continue;
-		}
-
-retry:
-		header.val = ntohl(header.val);
-
-		to_read = HEADER_SIZE(&header);
-		printf(" hdr=%.8x SEQ=%3u/%2x SY=%u %c%c%c%c%c len=%3zd",
-		       header.val,
-		       HEADER_SEQ(&header), HEADER_SEQ(&header),
-		       HEADER_SY(&header),
-		       HEADER_FLIP(&header) ? 'F' : '_',
-		       HEADER_REAL(&header) ? 'R' : '_',
-		       HEADER_AUDIO(&header) ? 'A' : '_',
-		       HEADER_SYNC(&header) ? 'S' : '_',
-		       HEADER_unk1(&header) ? 'U' : '_',
-		       to_read);
-
-		bool dump_video = false;
-		if (to_read) {
-			rd = read(in_fd, buf, to_read);
-			if (rd < 0) {
-				puts("");
-				fflush(stdout);
-				err(1, "read(data) at 0x%zx", off);
-			}
-			if (rd != to_read)
-				break;
-
-			/* BUG in FW? */
-			if (to_read == 4 && buf[0] == 0xfa) {
-				printf(" BAD -- retrying\noff=%8zx", off);
-				memcpy(&header, buf, sizeof(header));
-				goto retry;
-			}
-
-			if (HEADER_unk1(&header)) {
-				printf(" U");
-			} else if (HEADER_SYNC(&header)) {
-				ssize += rd;
-				printf(" S");
-				dump_video = true;
-				if (!synced) {
-					asize = 0;
-					ssize = 0;
-					vsize = 0;
-				}
-				synced = true;
-			} else if (HEADER_AUDIO(&header)) {
-				printf(" A");
-				if (synced && audio_fd >= 0)
-					write(audio_fd, buf, rd);
-				asize += rd;
-			} else if (to_read == 180) {
-				printf(" V");
-				if (synced && video_fd >= 0 &&
-				    vsize + (size_t)rd < sizeof(videobuf))
-					memcpy(&videobuf[vsize], buf,
-					       rd);
-				vsize += rd;
-			} else
-				printf(" _");
-
-			off += rd;
-			printf(" vsize=%6u asize=%8u", vsize, asize);
-			dump_data_limited("payl", buf, rd, 12);
-		}
-
-		puts("");
-
-		if (dump_video && vsize) {
-			if (synced && video_fd >= 0) {
-				printf("dumping; ");
-				write(video_fd, videobuf, sizeof(videobuf));
-				memset(videobuf, 0, sizeof(videobuf));
-			}
-			printf("vsize=%u ssize=%u\n", vsize, ssize);
-			vsize = 0;
-			ssize = 0;
-		}
-
-		if (pkt++ >= pkt_lim)
-			break;
+		return af9035->packet_buf;
 	}
 
-	puts("");
+	return NULL;
 }
 
+static void demux_one(struct af9035 *af9035, struct af9035_packet *header)
+{
+	bool dump_video = false;
+	ssize_t to_read;
+
+	printf("off=%8zx", af9035->off);
+
+	if (header->FA != 0xfa) {
+		printf(" BAD(%.8x)\n", be32_to_cpu(header->val));
+		return;
+	}
+
+retry:
+	header->val = be32_to_cpu(header->val);
+
+	to_read = HEADER_SIZE(header);
+	pr_cont(" hdr=%.8x SEQ=%3u/%2x SY=%u %c%c%c%c%c len=%3zd",
+		header->val,
+		HEADER_SEQ(header), HEADER_SEQ(header),
+		HEADER_SY(header),
+		HEADER_FLIP(header) ? 'F' : '_',
+		HEADER_REAL(header) ? 'R' : '_',
+		HEADER_AUDIO(header) ? 'A' : '_',
+		HEADER_SYNC(header) ? 'S' : '_',
+		HEADER_unk1(header) ? 'U' : '_',
+		to_read);
+
+	if (to_read) {
+		/* BUG in FW? */
+		if (to_read == 4 && header->data[0] == 0xfa) {
+			printf(" BAD -- retrying\noff=%8zx", af9035->off);
+			memmove(header, af9035->packet_buf, sizeof(*header));
+			goto retry;
+		}
+
+		if (HEADER_unk1(header)) {
+			printf(" U");
+		} else if (HEADER_SYNC(header)) {
+			af9035->ssize += to_read;
+			printf(" S");
+			dump_video = true;
+			if (!af9035->synced) {
+				af9035->asize = 0;
+				af9035->ssize = 0;
+				af9035->vsize = 0;
+			}
+			af9035->synced = true;
+		} else if (HEADER_AUDIO(header)) {
+			printf(" A");
+			if (af9035->synced && audio_fd >= 0)
+				write(audio_fd, af9035->packet_buf, to_read);
+			af9035->asize += to_read;
+		} else if (to_read == 180) {
+			printf(" V");
+			if (af9035->synced && video_fd >= 0 &&
+			    af9035->vsize + (size_t)to_read < sizeof(af9035->videobuf))
+				memcpy(&af9035->videobuf[af9035->vsize],
+				       af9035->packet_buf, to_read);
+			af9035->vsize += to_read;
+		} else
+			printf(" _");
+
+		printf(" vsize=%6u asize=%8u", af9035->vsize, af9035->asize);
+		dump_data_limited("payl", af9035->packet_buf, to_read, 12);
+	}
+
+	pr_cont("\n");
+
+	if (dump_video && af9035->vsize) {
+		if (af9035->synced && video_fd >= 0) {
+			printf("dumping; ");
+			write(video_fd, af9035->videobuf, sizeof(af9035->videobuf));
+			memset(af9035->videobuf, 0, sizeof(af9035->videobuf));
+		}
+		printf("vsize=%u ssize=%u\n", af9035->vsize, af9035->ssize);
+		af9035->vsize = 0;
+		af9035->ssize = 0;
+	}
+}
+
+void demux(struct af9035 *af9035, const uint8_t *isoc_data, uint32_t len)
+{
+	struct af9035_packet *pkt;
+
+	while ((pkt = get_data(af9035, &isoc_data, &len, sizeof(*af9035))))
+		demux_one(af9035, pkt);
+}
