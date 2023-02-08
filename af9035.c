@@ -90,6 +90,11 @@ static const u32 clock_lut_af9035[] = {
 	12000000, /* 12.00 MHz */
 };
 
+struct af9035_buf {
+	struct vb2_v4l2_buffer vb;
+	struct list_head list;
+};
+
 struct af9035 {
 #define BUF_LEN 64
 	u8 buf[BUF_LEN];
@@ -118,6 +123,8 @@ struct af9035 {
 	/* List of videobuf2 buffers protected by a lock. */
 	spinlock_t buflock;
 	struct list_head bufs;
+	void *cur_frame;
+	struct af9035_buf *cur_buf;
 
 	unsigned packet_buf_ptr;
 	u8 packet_buf[PACKET_SIZE];
@@ -127,6 +134,7 @@ struct af9035 {
 };
 
 static int af9035_sleep(struct af9035 *af9035);
+static void get_buf_frame(struct af9035 *af9035);
 
 /* =========================== FROM dvb_usb_urb.c =========================== */
 
@@ -661,11 +669,6 @@ err:
 
 /* =========================== V4L =========================== */
 
-struct af9035_buf {
-	struct vb2_v4l2_buffer vb;
-	struct list_head list;
-};
-
 static int af9035_queue_setup(struct vb2_queue *vq,
 			     unsigned int *nbuffers,
 			     unsigned int *nplanes, unsigned int sizes[],
@@ -693,13 +696,13 @@ static void af9035_buf_queue(struct vb2_buffer *vb)
 	spin_lock_irqsave(&af9035->buflock, flags);
 	list_add_tail(&buf->list, &af9035->bufs);
 	spin_unlock_irqrestore(&af9035->buflock, flags);
+	dev_dbg(&af9035->intf->dev, "%s: queued buf=%p\n", __func__, buf);
 }
 
 static void af9035_reclaim_buffers(struct af9035 *af9035,
 				   enum vb2_buffer_state state)
 {
 	unsigned long flags;
-	unsigned cnt = 0;
 
 	spin_lock_irqsave(&af9035->buflock, flags);
 	while (!list_empty(&af9035->bufs)) {
@@ -707,7 +710,6 @@ static void af9035_reclaim_buffers(struct af9035 *af9035,
 				struct af9035_buf, list);
 		vb2_buffer_done(&buf->vb.vb2_buf, state);
 		list_del(&buf->list);
-		cnt++;
 	}
 	spin_unlock_irqrestore(&af9035->buflock, flags);
 }
@@ -1057,7 +1059,6 @@ static void copy_to_local(struct af9035 *af9035, const uint8_t *isoc_data,
 }
 
 static void demux_one(struct af9035 *af9035,
-		      struct af9035_buf *buf, void *frame,
 		      const struct af9035_packet *pkt)
 {
 	bool dump_video = false;
@@ -1085,9 +1086,10 @@ static void demux_one(struct af9035 *af9035,
 		af9035->asize += to_read;
 	} else if (to_read == 180) {
 		//pr_cont(" V");
-		if (af9035->synced &&
+		if (af9035->synced && af9035->cur_frame &&
 		    af9035->vsize + to_read < VBUF_SIZE)
-			memcpy(frame + af9035->vsize, pkt->data, to_read);
+			memcpy(af9035->cur_frame + af9035->vsize, pkt->data,
+					to_read);
 		af9035->vsize += to_read;
 	} else
 		;//pr_cont(" _");
@@ -1096,12 +1098,15 @@ static void demux_one(struct af9035 *af9035,
 	dump_data_limitedX("payl", af9035->packet_buf, to_read, 12);*/
 
 	if (dump_video && af9035->vsize) {
+		struct af9035_buf *buf = af9035->cur_buf;
 		//pr_cont("\n");
 		//dev_dbg(&af9035->intf->dev, " ");
-		if (af9035->synced) {
+		if (af9035->synced && buf) {
 			int size = vb2_plane_size(&buf->vb.vb2_buf, 0);
 			//pr_cont("dumping; ");
 
+			dev_dbg(&af9035->intf->dev, "%s: done buf=%p\n",
+					__func__, buf);
 			buf->vb.field = af9035->sequence & 1 ? V4L2_FIELD_TOP :
 				V4L2_FIELD_BOTTOM;
 			buf->vb.sequence = af9035->sequence++;
@@ -1109,6 +1114,7 @@ static void demux_one(struct af9035 *af9035,
 			vb2_set_plane_payload(&buf->vb.vb2_buf, 0, size);
 			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 			list_del(&buf->list);
+			get_buf_frame(af9035);
 		}
 		//pr_cont("vsize=%u ssize=%u\n", af9035->vsize, af9035->ssize);
 		af9035->vsize = 0;
@@ -1117,7 +1123,6 @@ static void demux_one(struct af9035 *af9035,
 }
 
 static unsigned demux_packet(struct af9035 *af9035,
-			     struct af9035_buf *buf, void *frame,
 			     const uint8_t *isoc_data, uint32_t len)
 {
 	const struct af9035_packet *pkt;
@@ -1182,7 +1187,7 @@ static unsigned demux_packet(struct af9035 *af9035,
 			//pr_cont(" BAD -- retrying\n");
 			copy_to_local(af9035, pkt->data, 4);
 		} else
-			demux_one(af9035, buf, frame, pkt);
+			demux_one(af9035, pkt);
 	}
 
 	/*pr_cont(" sub=%3u advancing=%3zu\n", had_in_buf,
@@ -1192,13 +1197,12 @@ static unsigned demux_packet(struct af9035 *af9035,
 }
 
 static bool af9035_output_to_frame(struct af9035 *af9035,
-				   struct af9035_buf *buf, void *frame,
 				   const u8 *data, unsigned len)
 {
 	unsigned size;
 
 	while (len) {
-		size = demux_packet(af9035, buf, frame, data, len);
+		size = demux_packet(af9035, data, len);
 		af9035->off += size;
 		data += size;
 		len -= size;
@@ -1209,27 +1213,32 @@ static bool af9035_output_to_frame(struct af9035 *af9035,
 
 /* =========================== DEV =========================== */
 
+static void get_buf_frame(struct af9035 *af9035)
+{
+	if (list_empty(&af9035->bufs)) {
+		af9035->cur_buf = af9035->cur_frame = NULL;
+		return;
+	}
+
+	af9035->cur_buf = list_first_entry(&af9035->bufs, struct af9035_buf,
+					   list);
+	af9035->cur_frame = vb2_plane_vaddr(&af9035->cur_buf->vb.vb2_buf, 0);
+}
+
 static void af9035_complete(struct af9035 *af9035, const u8 *data, unsigned len)
 {
-	struct af9035_buf *buf;
 	unsigned long flags;
-	void *frame;
 
 	//print_hex_dump_bytes("pkt: ", DUMP_PREFIX_NONE, data, min(len, 16U));
 
         spin_lock_irqsave(&af9035->buflock, flags);
 
-        if (list_empty(&af9035->bufs)) {
-                /* No free buffers. Userspace likely too slow. */
-                spin_unlock_irqrestore(&af9035->buflock, flags);
-                return;
-        }
+	get_buf_frame(af9035);
 
-        /* First available buffer. */
-        buf = list_first_entry(&af9035->bufs, struct af9035_buf, list);
-        frame = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
-
-	af9035_output_to_frame(af9035, buf, frame, data, len);
+	dev_dbg(&af9035->intf->dev, "%s: out to buf %p (%d)\n", __func__,
+			af9035->cur_buf,
+			af9035->cur_buf ? af9035->cur_buf->vb.vb2_buf.state : -1);
+	af9035_output_to_frame(af9035, data, len);
 
         spin_unlock_irqrestore(&af9035->buflock, flags);
 }
