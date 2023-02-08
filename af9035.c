@@ -21,7 +21,6 @@
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
-//#include "af9033.h"
 #include "blob.h"
 
 #define USB_VID_DEXATEK		0x1d19
