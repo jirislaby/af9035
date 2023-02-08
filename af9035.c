@@ -872,9 +872,9 @@ static int af9035_fmt_vid_cap(struct file *file, void *priv,
 			      struct v4l2_format *f)
 {
 	f->fmt.pix.width = 720;
-	f->fmt.pix.height = 576;
+	f->fmt.pix.height = 576/2;
 	f->fmt.pix.pixelformat = V4L2_PIX_FMT_UYVY;
-	f->fmt.pix.field = V4L2_FIELD_SEQ_BT;
+	f->fmt.pix.field = V4L2_FIELD_ALTERNATE;
 	f->fmt.pix.bytesperline = 720 * 2;
 	f->fmt.pix.sizeimage = (f->fmt.pix.bytesperline * f->fmt.pix.height);
 	f->fmt.pix.colorspace = V4L2_COLORSPACE_DEFAULT;
@@ -889,6 +889,20 @@ static int af9035_g_std(struct file *file, void *priv, v4l2_std_id *norm)
 	return 0;
 }
 
+static int af9035_s_std(struct file *file, void *priv, v4l2_std_id norm)
+{
+	if (norm == V4L2_STD_625_50)
+		return 0;
+
+	return -EINVAL;
+}
+
+static int af9035_g_input(struct file *file, void *priv, unsigned int *i)
+{
+	*i = 0;
+	return 0;
+}
+
 static const struct v4l2_ioctl_ops af9035_ioctl_ops = {
 	.vidioc_querycap = af9035_querycap,
 	.vidioc_enum_input = af9035_enum_input,
@@ -897,8 +911,8 @@ static const struct v4l2_ioctl_ops af9035_ioctl_ops = {
 	.vidioc_try_fmt_vid_cap = af9035_fmt_vid_cap,
 	.vidioc_s_fmt_vid_cap = af9035_fmt_vid_cap,
 	.vidioc_g_std = af9035_g_std,
-//	.vidioc_s_std = af9035_s_std,
-//	.vidioc_g_input = af9035_g_input,
+	.vidioc_s_std = af9035_s_std,
+	.vidioc_g_input = af9035_g_input,
 //	.vidioc_s_input = af9035_s_input,
 
 	.vidioc_reqbufs = vb2_ioctl_reqbufs,
@@ -1088,7 +1102,8 @@ static void demux_one(struct af9035 *af9035,
 			int size = vb2_plane_size(&buf->vb.vb2_buf, 0);
 			//pr_cont("dumping; ");
 
-			buf->vb.field = V4L2_FIELD_SEQ_BT;
+			buf->vb.field = af9035->sequence & 1 ? V4L2_FIELD_TOP :
+				V4L2_FIELD_BOTTOM;
 			buf->vb.sequence = af9035->sequence++;
 			buf->vb.vb2_buf.timestamp = ktime_get_ns();
 			vb2_set_plane_payload(&buf->vb.vb2_buf, 0, size);
