@@ -128,7 +128,7 @@ struct af9035 {
 
 	unsigned packet_buf_ptr;
 	u8 packet_buf[PACKET_SIZE];
-	bool synced;
+	bool synced, last_tb;
 	unsigned sequence, vsize, asize, ssize;
 	off_t off;
 };
@@ -674,6 +674,10 @@ static int af9035_queue_setup(struct vb2_queue *vq,
 			     unsigned int *nplanes, unsigned int sizes[],
 			     struct device *alloc_devs[])
 {
+	/* check for V4L2_FIELD_ALTERNATE */
+	if (vb2_fileio_is_active(vq))
+		return -EINVAL;
+
 	*nbuffers = 2;
 	*nplanes = 1;
 	sizes[0] = VBUF_SIZE;
@@ -1086,9 +1090,11 @@ static void demux_one(struct af9035 *af9035,
 	} else if (to_read == 180) {
 		//pr_cont(" V");
 		if (af9035->synced && af9035->cur_frame &&
-		    af9035->vsize + to_read < VBUF_SIZE)
+		    af9035->vsize + to_read < VBUF_SIZE) {
 			memcpy(af9035->cur_frame + af9035->vsize, pkt->data,
 					to_read);
+			af9035->last_tb = HEADER_TB(val);
+		}
 		af9035->vsize += to_read;
 	} else {
 		//pr_cont(" _");
@@ -1106,10 +1112,12 @@ static void demux_one(struct af9035 *af9035,
 			//pr_cont("dumping; ");
 
 			dev_dbg(&af9035->intf->dev, "%s: done buf=%p (TB=%u)\n",
-					__func__, buf, HEADER_TB(val));
-			buf->vb.field = af9035->sequence & 1 ? V4L2_FIELD_TOP :
+					__func__, buf, af9035->last_tb);
+			buf->vb.field = af9035->last_tb ? V4L2_FIELD_TOP :
 				V4L2_FIELD_BOTTOM;
-			buf->vb.sequence = af9035->sequence++;
+			buf->vb.sequence = af9035->sequence;
+			if (af9035->last_tb)
+				af9035->sequence++;
 			buf->vb.vb2_buf.timestamp = ktime_get_ns();
 			vb2_set_plane_payload(&buf->vb.vb2_buf, 0, size);
 			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
