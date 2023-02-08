@@ -696,7 +696,6 @@ static void af9035_buf_queue(struct vb2_buffer *vb)
 	spin_lock_irqsave(&af9035->buflock, flags);
 	list_add_tail(&buf->list, &af9035->bufs);
 	spin_unlock_irqrestore(&af9035->buflock, flags);
-	dev_dbg(&af9035->intf->dev, "%s: queued buf=%p\n", __func__, buf);
 }
 
 static void af9035_reclaim_buffers(struct af9035 *af9035,
@@ -1004,7 +1003,7 @@ struct af9035_packet {
 			 * 4 bits: size_bot
 			 * 4 bits: seq_bot
 			 * 5 bits: seq_top
-			 * 1 bits: FLIP
+			 * 1 bits: top bottom field?
 			 * 2 bits: size_top
 			 * 1 bit: REAL
 			 * 1 bit: AUDIO
@@ -1024,7 +1023,7 @@ struct af9035_packet {
 #define HEADER_SEQ_BOT(val)	(((val) & 0x000f0000) >> 16)
 #define  HEADER_SEQ_BOT_BITS	4
 #define HEADER_SEQ_TOP(val)	(((val) & 0x0000f800) >> 11)
-#define HEADER_FLIP(val)	(((val) & 0x00000400) >> 10)
+#define HEADER_TB(val)		(((val) & 0x00000400) >> 10)
 #define HEADER_HISIZE(val)	(((val) & 0x00000300) >>  8)
 #define HEADER_REAL(val)	(((val) & 0x00000080) >>  7)
 #define HEADER_AUDIO(val)	(((val) & 0x00000040) >>  6)
@@ -1091,8 +1090,9 @@ static void demux_one(struct af9035 *af9035,
 			memcpy(af9035->cur_frame + af9035->vsize, pkt->data,
 					to_read);
 		af9035->vsize += to_read;
-	} else
-		;//pr_cont(" _");
+	} else {
+		//pr_cont(" _");
+	}
 
 	/*pr_cont(" vsize=%6u asize=%8u", af9035->vsize, af9035->asize);
 	dump_data_limitedX("payl", af9035->packet_buf, to_read, 12);*/
@@ -1105,8 +1105,8 @@ static void demux_one(struct af9035 *af9035,
 			int size = vb2_plane_size(&buf->vb.vb2_buf, 0);
 			//pr_cont("dumping; ");
 
-			dev_dbg(&af9035->intf->dev, "%s: done buf=%p\n",
-					__func__, buf);
+			dev_dbg(&af9035->intf->dev, "%s: done buf=%p (TB=%u)\n",
+					__func__, buf, HEADER_TB(val));
 			buf->vb.field = af9035->sequence & 1 ? V4L2_FIELD_TOP :
 				V4L2_FIELD_BOTTOM;
 			buf->vb.sequence = af9035->sequence++;
@@ -1235,9 +1235,9 @@ static void af9035_complete(struct af9035 *af9035, const u8 *data, unsigned len)
 
 	get_buf_frame(af9035);
 
-	dev_dbg(&af9035->intf->dev, "%s: out to buf %p (%d)\n", __func__,
-			af9035->cur_buf,
-			af9035->cur_buf ? af9035->cur_buf->vb.vb2_buf.state : -1);
+	/*if (!af9035->cur_buf)
+		dev_dbg(&af9035->intf->dev, "%s: NO BUF\n", __func__);*/
+
 	af9035_output_to_frame(af9035, data, len);
 
         spin_unlock_irqrestore(&af9035->buflock, flags);
