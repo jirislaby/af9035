@@ -96,7 +96,8 @@ static const struct {
 };
 
 static int dump_isoc = -1, dump_fw = -1;
-static bool verbose, silent, hex_data;
+static bool hex_data;
+unsigned verbosity;
 int video_fd = -1, audio_fd = -1;
 
 void dump_data(const char *prefix, const uint8_t *data, unsigned len)
@@ -254,21 +255,21 @@ static void handle_af9035(uint32_t sec, uint32_t usec,
 
 	printf("\t");
 
-	if (!silent)
+	if (verbosity)
 		printf("%4u.%.4u", sec, usec / 100);
 
 	printf(" BULK ep=%u %s len=%2u ", ep, in ? " IN" : "OUT", af->len);
 
-	if (!silent)
+	if (verbosity)
 		printf("csum=%4x", csum);
 
 	if (in) {
-		if (!silent)
+		if (verbosity)
 			printf(" seq=%3u", af->rd.seq);
 		printf(" sta=%.2x", af->rd.sta);
 	} else {
 		start++;
-		if (!silent)
+		if (verbosity)
 			printf(" seq=%3u", af->wr.seq);
 		printf(" mbox=%.2x cmd=%5s", af->wr.mbox,
 				get_cmd_desc(af->wr.cmd));
@@ -296,7 +297,7 @@ static void handle_ctrl(const struct usb_pkt *pkt, uint32_t sec)
 #if 0
 	printf("\t");
 
-	if (!silent)
+	if (verbosity)
 		printf("%4u.%.4u", sec, pkt->usec / 100);
 
 	printf(" CTRL");
@@ -309,10 +310,15 @@ static void handle_ctrl(const struct usb_pkt *pkt, uint32_t sec)
 static void handle_single_isoc(struct af9035 *af9035, const uint8_t *isoc_data,
 			       uint32_t len)
 {
-	dump_data_limited("data", isoc_data, len, 20);
-	demux(af9035, isoc_data, len);
-	if (dump_isoc >= 0)
-		write(dump_isoc, isoc_data, len);
+	if (verbosity >= 2) {
+		dump_data_limited("idata", isoc_data, len, 20);
+		puts("");
+	}
+	if (len) {
+		demux(af9035, isoc_data, len);
+		if (dump_isoc >= 0)
+			write(dump_isoc, isoc_data, len);
+	}
 }
 
 static void handle_isoc(struct af9035 *af9035, const struct usb_pkt *pkt,
@@ -329,7 +335,7 @@ static void handle_isoc(struct af9035 *af9035, const struct usb_pkt *pkt,
 
 	printf("\t");
 
-	if (!silent)
+	if (verbosity)
 		printf("%4u.%.4u", sec, pkt->usec / 100);
 
 	printf(" ISOC ep=%u %s isoc_nr=%3u (valid=%u)\n",
@@ -341,13 +347,18 @@ static void handle_isoc(struct af9035 *af9035, const struct usb_pkt *pkt,
 
 	const void *isoc_data = isoc + pkt->isoc_nr;
 	for (a = 0, (const void *)pkt->data; a < pkt->isoc_nr; a++, isoc++) {
-		if (isoc->stat == 0 || !silent)
+		bool eol_needed = false;
+		if ((verbosity >= 1 && isoc->stat == 0) || verbosity >= 2) {
 			printf("\t\tIDESC %2u[%4d/%5u/%4u]", a, isoc->stat, isoc->off,
 			       isoc->len);
-		if (isoc->stat == 0)
+			eol_needed = true;
+		}
+		if (isoc->stat == 0) {
 			handle_single_isoc(af9035, isoc_data + isoc->off,
 					   isoc->len);
-		if (isoc->stat == 0 || !silent)
+			eol_needed = verbosity > 0 && verbosity < 2;
+		}
+		if (eol_needed)
 			puts("");
 	}
 }
@@ -375,7 +386,7 @@ static void handle_packet(struct af9035 *af9035, const struct usb_pkt *pkt)
 	if (!first_sec)
 		first_sec = pkt->sec;
 
-	if (verbose) {
+	if (verbosity >= 3) {
 		printf("%c ttype=%s, dlen=%3u", pkt->type, get_ttype(pkt), pkt->dlen);
 		dump_data_limited("data", pkt->data, pkt->dlen, 30);
 		puts("");
@@ -406,7 +417,7 @@ int main(int argc, char **argv)
 
 	int o;
 
-	while ((o = getopt(argc, argv, "adfsvVx")) != -1) {
+	while ((o = getopt(argc, argv, "adfsSvVx")) != -1) {
 		switch (o) {
 		case 'a':
 			audio_fd = open("audio.raw", O_WRONLY | O_CREAT |
@@ -425,10 +436,13 @@ int main(int argc, char **argv)
 				err(1, "open(fw.raw)");
 			break;
 		case 's':
-			silent = true;
+			verbosity = 1;
+			break;
+		case 'S':
+			verbosity = 2;
 			break;
 		case 'v':
-			verbose = true;
+			verbosity = 3;
 			break;
 		case 'V':
 			video_fd = open("video.raw", O_WRONLY | O_CREAT |
