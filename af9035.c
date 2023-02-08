@@ -72,6 +72,8 @@
 #define STREAM_BUF_SIZE		3072
 
 #define PACKET_SIZE		184
+/* half-size (interlacing) of 16bit (UYVY) 720x576 picture */
+#define VBUF_SIZE		(720*576*2/2)
 
 static const u32 clock_lut_af9035[] = {
 	20480000, /*      FPGA */
@@ -98,12 +100,6 @@ struct af9035 {
 	u16 chip_type;
 
 	u8 eeprom[256];
-	//u8 af9033_i2c_addr[2];
-
-	//#define AF9035_I2C_CLIENT_MAX 4
-	//struct i2c_client *i2c_client[AF9035_I2C_CLIENT_MAX];
-
-	//struct af9033_config af9033_config;
 
 	struct usb_interface *intf;
 
@@ -123,9 +119,11 @@ struct af9035 {
 	spinlock_t buflock;
 	struct list_head bufs;
 
+	unsigned packet_buf_ptr;
 	u8 packet_buf[PACKET_SIZE];
 	bool synced;
-	unsigned sequence, vsize, asize;
+	unsigned sequence, vsize, asize, ssize;
+	off_t off;
 };
 
 static int af9035_sleep(struct af9035 *af9035);
@@ -675,8 +673,7 @@ static int af9035_queue_setup(struct vb2_queue *vq,
 {
 	*nbuffers = 2;
 	*nplanes = 1;
-	/* half-size (interlacing) of 16bit (UYVY) 720x576 picture */
-	sizes[0] = 720*576*2/2;
+	sizes[0] = VBUF_SIZE;
 
 	return 0;
 }
@@ -753,10 +750,13 @@ static int af9035_start_streaming(struct vb2_queue *vq, unsigned int count)
 	struct af9035 *af9035 = vb2_get_drv_priv(vq);
 	int ret;
 
+	af9035->packet_buf_ptr = 0;
 	af9035->synced = false;
 	af9035->sequence = 0;
 	af9035->vsize = 0;
 	af9035->asize = 0;
+	af9035->ssize = 0;
+	af9035->off = 0;
 
 	if (af9035->intf == NULL) {
 		ret = -ENODEV;
@@ -980,174 +980,215 @@ static void af9035_video_free(struct af9035 *af9035)
 
 /* =========================== FRAME decode =========================== */
 
-struct header {
+struct af9035_packet {
 	union {
 		struct {
 			uint8_t FA;
 			/*
-			 * 4 bits: type
+			 * 4 bits: size_bot
 			 * 4 bits: seq_bot
 			 * 5 bits: seq_top
-			 * 3 bits: ???
-			 * 1 bit: FINAL
-			 * 1 bit: SPEC
-			 * 1 bit: AUDIO
+			 * 1 bits: FLIP
+			 * 2 bits: size_top
 			 * 1 bit: REAL
+			 * 1 bit: AUDIO
+			 * 1 bit: SYNC
+			 * 1 bit: ??
 			 * 4 bits: synch
 			 */
-			uint8_t type_seq;
-			uint8_t seq_res;
-			uint8_t res_stream;
+			uint8_t res[3];
 		};
 		uint32_t val;
 	};
+	uint8_t data[];
 } __attribute__((packed));
 
-#define HEADER_FA(hdr)		(((hdr)->val & 0xff000000) >> 24)
-#define HEADER_WORDS(hdr)	(((hdr)->val & 0x00f00000) >> 20)
-#define HEADER_SEQ_BOT(hdr)	(((hdr)->val & 0x000f0000) >> 16)
+#define HEADER_FA(val)		(((val) & 0xff000000) >> 24)
+#define HEADER_WORDS(val)	(((val) & 0x00f00000) >> 20)
+#define HEADER_SEQ_BOT(val)	(((val) & 0x000f0000) >> 16)
 #define  HEADER_SEQ_BOT_BITS	4
-#define HEADER_SEQ_TOP(hdr)	(((hdr)->val & 0x0000f800) >> 11)
-#define HEADER_FLIP(hdr)	(((hdr)->val & 0x00000400) >> 10)
-#define HEADER_HISIZE(hdr)	(((hdr)->val & 0x00000300) >>  8)
-#define HEADER_REAL(hdr)	(((hdr)->val & 0x00000080) >>  7)
-#define HEADER_AUDIO(hdr)	(((hdr)->val & 0x00000040) >>  6)
-#define HEADER_SYNC(hdr)	(((hdr)->val & 0x00000020) >>  5)
-#define HEADER_unk1(hdr)	(((hdr)->val & 0x00000010) >>  4)
-#define HEADER_XXX_MASK(hdr)	(((hdr)->val & 0x000000f0) >>  4)
-#define HEADER_SY(hdr)		(((hdr)->val & 0x0000000f) >>  0)
+#define HEADER_SEQ_TOP(val)	(((val) & 0x0000f800) >> 11)
+#define HEADER_FLIP(val)	(((val) & 0x00000400) >> 10)
+#define HEADER_HISIZE(val)	(((val) & 0x00000300) >>  8)
+#define HEADER_REAL(val)	(((val) & 0x00000080) >>  7)
+#define HEADER_AUDIO(val)	(((val) & 0x00000040) >>  6)
+#define HEADER_SYNC(val)	(((val) & 0x00000020) >>  5)
+#define HEADER_unk1(val)	(((val) & 0x00000010) >>  4)
+#define HEADER_XXX_MASK(val)	(((val) & 0x000000f0) >>  4)
+#define HEADER_SY(val)		(((val) & 0x0000000f) >>  0)
 
-static inline uint16_t HEADER_SEQ(const struct header *hdr)
+static inline uint16_t HEADER_SEQ(const uint32_t val)
 {
-	uint16_t seq = HEADER_SEQ_TOP(hdr);
+	uint16_t seq = HEADER_SEQ_TOP(val);
 
 	seq <<= HEADER_SEQ_BOT_BITS;
-	seq |= HEADER_SEQ_BOT(hdr);
+	seq |= HEADER_SEQ_BOT(val);
 
 	WARN_ON(seq & 1);
 
 	return seq >> 1;
 }
 
-static inline unsigned HEADER_SIZE(const struct header *hdr)
+static inline unsigned HEADER_SIZE(const uint32_t val)
 {
-	return (HEADER_HISIZE(hdr) << 6) | (HEADER_WORDS(hdr) << 2);
+	return (HEADER_HISIZE(val) << 6) | (HEADER_WORDS(val) << 2);
 }
 
-static int maincoon(struct af9035 *af9035)
+static void copy_to_local(struct af9035 *af9035, const uint8_t *isoc_data,
+			  unsigned to_copy)
 {
-	struct header header;
-	ssize_t to_read;
+	memmove(af9035->packet_buf + af9035->packet_buf_ptr, isoc_data,
+		to_copy);
+	af9035->packet_buf_ptr += to_copy;
+}
 
-	while (1) {
-		bool dump_video = false;
-		ssize_t rd = read((void *)&header, sizeof(header));
-		if (!rd)
-			break;
+static void demux_one(struct af9035 *af9035,
+		      struct af9035_buf *buf, void *frame,
+		      const struct af9035_packet *pkt)
+{
+	bool dump_video = false;
+	uint32_t val = be32_to_cpu(pkt->val);
+	unsigned to_read = HEADER_SIZE(val);
 
-		if (rd != sizeof(header)) {
-			dev_warn(&af9035->intf->dev, "read(header)\n");
-			return -EIO;
+	if (HEADER_unk1(val)) {
+		//pr_cont(" U");
+	} else if (HEADER_SYNC(val)) {
+		af9035->ssize += to_read;
+		//pr_cont(" S");
+		dump_video = true;
+		if (!af9035->synced) {
+			af9035->asize = 0;
+			af9035->ssize = 0;
+			af9035->vsize = 0;
 		}
-
-		if (header.FA != 0xfa) {
-			dev_dbg(&af9035->intf->dev, " BAD(%.8x)\n",
-					be32_to_cpu(header.val));
-			continue;
-		}
-
-retry:
-		header.val = be32_to_cpu(header.val);
-
-		to_read = HEADER_SIZE(&header);
-		dev_dbg(&af9035->intf->dev,
-				"hdr=%.8x SEQ=%3u/%2x SY=%u %c%c%c%c%c len=%3zd",
-		       header.val,
-		       HEADER_SEQ(&header), HEADER_SEQ(&header),
-		       HEADER_SY(&header),
-		       HEADER_FLIP(&header) ? 'F' : '_',
-		       HEADER_REAL(&header) ? 'R' : '_',
-		       HEADER_AUDIO(&header) ? 'A' : '_',
-		       HEADER_SYNC(&header) ? 'S' : '_',
-		       HEADER_unk1(&header) ? 'U' : '_',
-		       to_read);
-
-		if (to_read) {
-			rd = read(&af9035->packet_buf, to_read);
-			if (rd < 0) {
-				dev_warn(&af9035->intf->dev,
-					 "read(data) at 0xx");
-				return -EIO;
-			}
-			if (rd != to_read)
-				break;
-
-			/* BUG in FW? */
-			if (to_read == 4 && af9035->packet_buf[0] == 0xfa) {
-				pr_cont(" BAD -- retrying\n");
-				memcpy(&header, af9035->packet_buf,
-				       sizeof(header));
-				goto retry;
-			}
-
-			if (HEADER_unk1(&header)) {
-				pr_cont(" U");
-			} else if (HEADER_SYNC(&header)) {
-				pr_cont(" S");
-				dump_video = true;
-				if (!af9035->synced) {
-					af9035->asize = 0;
-					af9035->vsize = 0;
-				}
-				af9035->synced = true;
-			} else if (HEADER_AUDIO(&header)) {
-				pr_cont(" A");
+		af9035->synced = true;
+	} else if (HEADER_AUDIO(val)) {
+		//pr_cont(" A");
 #if 0
-				if (synced && audio_fd >= 0)
-					write(audio_fd, buf, rd);
-				asize += rd;
+		if (af9035->synced && audio_fd >= 0)
+			write(audio_fd, pkt->data, to_read);
 #endif
-			} else if (to_read == 180) {
-				pr_cont(" V");
-#if 0
-				if (af9035->synced &&
-				    af9035->vsize + (size_t)rd < sizeof(videobuf))
-					memcpy(&videobuf[af9035->vsize],
-					       &af9035->packet_buf[4], rd);
-#endif
-				af9035->vsize += rd;
-			} else
-				pr_cont(" _");
+		af9035->asize += to_read;
+	} else if (to_read == 180) {
+		//pr_cont(" V");
+		if (af9035->synced &&
+		    af9035->vsize + to_read < VBUF_SIZE)
+			memcpy(frame + af9035->vsize, pkt->data, to_read);
+		af9035->vsize += to_read;
+	} else
+		;//pr_cont(" _");
 
-			pr_cont(" vsize=%6u asize=%8u", af9035->vsize,
-				 af9035->asize);
-			//dump_data_limited("payl", buf, rd, 12);
+	/*pr_cont(" vsize=%6u asize=%8u", af9035->vsize, af9035->asize);
+	dump_data_limitedX("payl", af9035->packet_buf, to_read, 12);*/
+
+	if (dump_video && af9035->vsize) {
+		//pr_cont("\n");
+		//dev_dbg(&af9035->intf->dev, " ");
+		if (af9035->synced) {
+			int size = vb2_plane_size(&buf->vb.vb2_buf, 0);
+			//pr_cont("dumping; ");
+
+			buf->vb.field = V4L2_FIELD_SEQ_BT;
+			buf->vb.sequence = af9035->sequence++;
+			buf->vb.vb2_buf.timestamp = ktime_get_ns();
+			vb2_set_plane_payload(&buf->vb.vb2_buf, 0, size);
+			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+			list_del(&buf->list);
+		}
+		//pr_cont("vsize=%u ssize=%u\n", af9035->vsize, af9035->ssize);
+		af9035->vsize = 0;
+		af9035->ssize = 0;
+	}
+}
+
+static unsigned demux_packet(struct af9035 *af9035,
+			     struct af9035_buf *buf, void *frame,
+			     const uint8_t *isoc_data, uint32_t len)
+{
+	const struct af9035_packet *pkt;
+	unsigned to_read, had_in_buf = af9035->packet_buf_ptr;
+	uint32_t val;
+
+	/*dev_dbg(&af9035->intf->dev, " off=%8zx len=%4u buf_ptr=%3u",
+		af9035->off, len, af9035->packet_buf_ptr);*/
+
+	if (af9035->packet_buf_ptr) {
+		bool done = true;
+		pkt = (void *)af9035->packet_buf;
+		to_read = HEADER_SIZE(be32_to_cpu(pkt->val)) + sizeof(*pkt) -
+			af9035->packet_buf_ptr;
+
+		if (len < to_read) {
+			done = false;
+			to_read = len;
 		}
 
-		pr_cont("\n");
+		copy_to_local(af9035, isoc_data, to_read);
+		if (!done)
+			return to_read;
 
-#if 0
-		if (dump_video && vsize) {
-			if (synced && video_fd >= 0) {
-				printf("dumping; ");
-				write(video_fd, videobuf, sizeof(videobuf));
-				memset(videobuf, 0, sizeof(videobuf));
-			}
-			printf("vsize=%u\n", vsize);
-			vsize = 0;
-		}
-#endif
+		af9035->packet_buf_ptr = 0;
+	} else
+		pkt = (void *)isoc_data;
+
+	if (len < sizeof(*pkt)) {
+		copy_to_local(af9035, isoc_data, len);
+		WARN_ON(1);
+		return len;
 	}
 
-	pr_cont("\n");
+	if (pkt->FA != 0xfa) {
+		//pr_cont(" BAD(%.8x)\n", be32_to_cpu(pkt->val));
+		return 4;
+	}
 
-	return 0;
+	val = be32_to_cpu(pkt->val);
+	to_read = HEADER_SIZE(val);
+	/*pr_cont(" hdr=%.8x SEQ=%3u/%2x SY=%u %c%c%c%c%c len=%3u",
+		val,
+		HEADER_SEQ(val), HEADER_SEQ(val),
+		HEADER_SY(val),
+		HEADER_FLIP(val) ? 'F' : '_',
+		HEADER_REAL(val) ? 'R' : '_',
+		HEADER_AUDIO(val) ? 'A' : '_',
+		HEADER_SYNC(val) ? 'S' : '_',
+		HEADER_unk1(val) ? 'U' : '_',
+		to_read);*/
+
+	if (len < sizeof(*pkt) + to_read) {
+		copy_to_local(af9035, isoc_data, len);
+		//pr_cont(" STRAY need=%zu\n", sizeof(*pkt) + to_read);
+		return len;
+	}
+
+	if (to_read) {
+		/* BUG in FW? */
+		if (to_read == 4 && pkt->data[0] == 0xfa) {
+			//pr_cont(" BAD -- retrying\n");
+			copy_to_local(af9035, pkt->data, 4);
+		} else
+			demux_one(af9035, buf, frame, pkt);
+	}
+
+	/*pr_cont(" sub=%3u advancing=%3zu\n", had_in_buf,
+		sizeof(*pkt) + to_read - had_in_buf);*/
+
+	return sizeof(*pkt) + to_read - had_in_buf;
 }
 
-static bool af9035_output_to_frame(struct af9035 *af9035, void *frame,
+static bool af9035_output_to_frame(struct af9035 *af9035,
+				   struct af9035_buf *buf, void *frame,
 				   const u8 *data, unsigned len)
 {
-	maincoon(af9035);
+	unsigned size;
+
+	while (len) {
+		size = demux_packet(af9035, buf, frame, data, len);
+		af9035->off += size;
+		data += size;
+		len -= size;
+	}
+
 	return false;
 }
 
@@ -1173,16 +1214,7 @@ static void af9035_complete(struct af9035 *af9035, const u8 *data, unsigned len)
         buf = list_first_entry(&af9035->bufs, struct af9035_buf, list);
         frame = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
 
-	if (af9035_output_to_frame(af9035, frame, data, len)) {
-		int size = vb2_plane_size(&buf->vb.vb2_buf, 0);
-
-		buf->vb.field = V4L2_FIELD_SEQ_BT;
-		buf->vb.sequence = af9035->sequence++;
-		buf->vb.vb2_buf.timestamp = ktime_get_ns();
-		vb2_set_plane_payload(&buf->vb.vb2_buf, 0, size);
-		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
-		list_del(&buf->list);
-	}
+	af9035_output_to_frame(af9035, buf, frame, data, len);
 
         spin_unlock_irqrestore(&af9035->buflock, flags);
 }
