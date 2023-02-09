@@ -171,7 +171,7 @@ static int af9035_rw(struct af9035 *af9035, u8 *wbuf, u16 wlen,
 
         //dev_dbg(&udev->dev, "%s: >>> %*ph\n", __func__, wlen, wbuf);
 
-        ret = usb_bulk_msg(udev, usb_sndbulkpipe(udev, 0x02), wbuf, wlen,
+        ret = usb_bulk_msg(udev, usb_sndbulkpipe(udev, 0x2), wbuf, wlen,
 			   &actual_length, 2000);
         if (ret) {
                 dev_err(&udev->dev, "%s: usb_bulk_msg() failed=%d\n",
@@ -186,7 +186,7 @@ static int af9035_rw(struct af9035 *af9035, u8 *wbuf, u16 wlen,
 
         /* an answer is expected */
         if (rbuf && rlen) {
-                ret = usb_bulk_msg(udev, usb_rcvbulkpipe(udev, 0x81),
+                ret = usb_bulk_msg(udev, usb_rcvbulkpipe(udev, 0x1),
 				   rbuf, rlen, &actual_length, 2000);
                 if (ret)
                         dev_err(&udev->dev,
@@ -1757,9 +1757,6 @@ static int af9035_probe(struct usb_interface *intf,
 
 		dev_info(&intf->dev, "%s: altset=%u\n", __func__,
 			 intf->cur_altsetting->desc.bAlternateSetting);
-
-		/* the device needs to set up itself after set_interface */
-		msleep(250);
 	}
 
 	af9035 = kzalloc(sizeof(*af9035), GFP_KERNEL);
