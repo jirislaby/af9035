@@ -442,15 +442,12 @@ static int af9035_identify_state(struct af9035 *state)
 	state->chip_version = rbuf[0];
 	state->chip_type = rbuf[2] << 8 | rbuf[1] << 0;
 
-	dev_dbg(&intf->dev, "chip_version=%02x chip_type=%04x\n",
-		state->chip_version, state->chip_type);
-
 	ret = af9035_rd_reg(state, 0x384f, &state->prechip_version);
 	if (ret < 0)
 		goto err;
 
-	dev_info(&intf->dev, "prechip_version=%02x chip_version=%02x chip_type=%04x\n",
-		 state->prechip_version, state->chip_version, state->chip_type);
+	dev_info(&intf->dev, "chip_version=%02x chip_type=%04x prechip_version=%02x\n",
+		 state->chip_version, state->chip_type, state->prechip_version);
 
 	/* Read and store eeprom */
 	for (i = 0; i < 256; i += 32) {
@@ -466,19 +463,17 @@ static int af9035_identify_state(struct af9035 *state)
 	/* check for dual tuner mode */
 	tmp = state->eeprom[EEPROM_TS_MODE];
 	if (tmp != 0)
-		dev_warn(&intf->dev, "ts mode=%d not supported!", tmp);
-
-	dev_dbg(&intf->dev, "ts mode=%d\n", tmp);
+		dev_warn(&intf->dev, "ts mode=%u not supported!", tmp);
 
 	ret = af9035_ctrl_msg(state, &req);
 	if (ret < 0)
 		goto err;
 
-	dev_dbg(&intf->dev, "firmware version=%d.%d.%d.%d",
-		rbuf[0], rbuf[1], rbuf[2], rbuf[3]);
-	if (rbuf[0] || rbuf[1] || rbuf[2] || rbuf[3])
+	if (rbuf[0] || rbuf[1] || rbuf[2] || rbuf[3]) {
+		dev_dbg(&intf->dev, "firmware version=%d.%d.%d.%d",
+			rbuf[0], rbuf[1], rbuf[2], rbuf[3]);
 		ret = WARM;
-	else
+	} else
 		ret = COLD;
 
 	return ret;
@@ -627,17 +622,8 @@ static int af9035_read_config(struct af9035 *state)
 	u8 tmp;
 	u16 tmp16;
 
-#if 0
-	/* Demod I2C address */
-	state->af9033_i2c_addr[0] = 0x1c;
-	state->af9033_i2c_addr[1] = 0x1d;
-	state->af9033_config.adc_multiplier = AF9033_ADC_MULTIPLIER_2X;
-	state->af9033_config.ts_mode = AF9033_TS_MODE_USB;
-#endif
-	//state->it930x_addresses = 0;
-
-	dev_dbg(&intf->dev, "ir=%02x/%02x\n", state->eeprom[EEPROM_IR_MODE],
-		state->eeprom[EEPROM_IR_TYPE]);
+	WARN_ON(state->eeprom[EEPROM_IR_MODE]);
+	WARN_ON(state->eeprom[EEPROM_IR_TYPE]);
 
 	/* tuner */
 	tmp = state->eeprom[EEPROM_1_TUNER_ID];
@@ -646,45 +632,34 @@ static int af9035_read_config(struct af9035 *state)
 		return -EINVAL;
 	}
 
-	dev_dbg(&intf->dev, "tuner=%02x\n", tmp);
-
-	//state->af9033_config.tuner = tmp;
-
 	/* tuner IF frequency */
 	tmp = state->eeprom[EEPROM_1_IF_L];
 	tmp16 = tmp << 0;
 	tmp = state->eeprom[EEPROM_1_IF_H];
 	tmp16 |= tmp << 8;
 	if (tmp16 != 0) {
-		dev_warn(&intf->dev, "freq not zero (%u)\n", tmp16);
+		dev_err(&intf->dev, "freq not zero (%u)\n", tmp16);
 		return -EINVAL;
 	}
 
-	dev_dbg(&intf->dev, "IF=%d\n", tmp16);
-
 	/* get demod clock */
 	ret = af9035_rd_reg(state, 0x00d800, &tmp);
-	if (ret < 0)
-		goto err;
+	if (ret < 0) {
+		dev_err(&intf->dev, "demod clock read failed\n");
+		return ret;
+	}
 
 	tmp = (tmp >> 0) & 0x0f;
 
 	if (tmp >= ARRAY_SIZE(clock_lut_af9035)) {
-		dev_warn(&intf->dev, "invalid clock offset: %u\n", tmp16);
+		dev_err(&intf->dev, "invalid clock offset: %u\n", tmp16);
 		return -EINVAL;
 	}
-
-	//state->af9033_config.clock = clock_lut_af9035[tmp];
 
 	dev_dbg(&intf->dev, "demod clk=%u -> %u kHz\n", tmp,
 		clock_lut_af9035[tmp] / 1000);
 
 	return 0;
-
-err:
-	dev_dbg(&intf->dev, "%s: failed=%d\n", __func__, ret);
-
-	return ret;
 }
 
 /* =========================== V4L =========================== */
@@ -1602,7 +1577,6 @@ static void af9035_urb_complete(struct urb *urb)
 	if (ret)
 		dev_dbg(&af9035->intf->dev, "%s: usb_submit_urb() failed=%d\n",
 			__func__, ret);
-	//dev_dbg(&af9035->intf->dev, "%s: urb (%p) submitted\n", __func__, urb);
 }
 
 static int af9035_load_fw(struct af9035 *af9035)
@@ -1611,8 +1585,11 @@ static int af9035_load_fw(struct af9035 *af9035)
 	int ret;
 
 	ret = request_firmware(&fw, AF9035_FIRMWARE, &af9035->intf->dev);
-	if (ret < 0)
+	if (ret < 0) {
+		dev_err(&af9035->intf->dev, "fw request for %s failed\n",
+			AF9035_FIRMWARE);
 		return ret;
+	}
 
 	ret = af9035_download_firmware(af9035, fw);
 	release_firmware(fw);
@@ -1635,12 +1612,9 @@ static void af9035_stream_free(struct af9035 *af9035)
 static int af9035_stream_init(struct af9035 *af9035)
 {
 	/* 15 * 32 * 3072 */
-	struct usb_host_endpoint *ep;
 	struct usb_device *udev = interface_to_usbdev(af9035->intf);
 	struct urb *urb;
-	int ret;
 
-	ret = -ENOMEM;
 	for (unsigned i = 0; i < ARRAY_SIZE(af9035->stream_bufs); i++) {
 		af9035->stream_bufs[i] = kcalloc(STREAM_BUFS_PER_URB,
 						 STREAM_BUF_SIZE, GFP_KERNEL);
@@ -1663,11 +1637,6 @@ static int af9035_stream_init(struct af9035 *af9035)
 			STREAM_BUF_SIZE;
 		urb->transfer_buffer = af9035->stream_bufs[i];
 
-		ep = usb_pipe_endpoint(udev, urb->pipe);
-		/*dev_dbg(&af9035->intf->dev, "urb pipe=%.8x maxp=%d isoc=%d\n",
-			urb->pipe, usb_endpoint_maxp(&ep->desc),
-			usb_endpoint_xfer_isoc(&ep->desc));*/
-
 		for (unsigned j = 0; j < STREAM_BUFS_PER_URB; j++) {
 			urb->iso_frame_desc[j].offset = STREAM_BUF_SIZE * j;
 			urb->iso_frame_desc[j].length = STREAM_BUF_SIZE;
@@ -1677,7 +1646,7 @@ static int af9035_stream_init(struct af9035 *af9035)
 	return 0;
 err:
 	af9035_stream_free(af9035);
-	return ret;
+	return -ENOMEM;
 }
 
 static int af9035_sleep(struct af9035 *af9035)
