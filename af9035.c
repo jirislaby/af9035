@@ -133,6 +133,7 @@ struct af9035 {
 	struct mutex usb_lock;
 	struct mutex start_lock;
 
+	atomic_t video_stream;
 	void *stream_bufs[STREAM_BUFS];
 	struct urb *urbs[STREAM_BUFS];
 	bool urbs_submitted[STREAM_BUFS];
@@ -776,8 +777,13 @@ static int af9035_start_streaming(struct vb2_queue *vq, unsigned int count)
 
 	ret = af9035_start(af9035);
 	if (ret)
-		af9035_reclaim_buffers(af9035, VB2_BUF_STATE_QUEUED);
+		goto err;
 
+	atomic_set(&af9035->video_stream, 1);
+
+	return 0;
+err:
+	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_QUEUED);
 	return ret;
 }
 
@@ -785,6 +791,7 @@ static void af9035_stop_streaming(struct vb2_queue *vq)
 {
 	struct af9035 *af9035 = vb2_get_drv_priv(vq);
 
+	atomic_set(&af9035->video_stream, 0);
 	af9035_stop(af9035);
 	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_ERROR);
 }
@@ -914,6 +921,8 @@ static int af9035_video_init(struct af9035 *af9035)
 {
 	struct usb_interface *intf = af9035->intf;
 	int ret;
+
+	atomic_set(&af9035->video_stream, 0);
 
 	/* videobuf2 structure */
 	af9035->vb2q.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -1098,7 +1107,8 @@ static void demux_one(struct af9035 *af9035,
 	} else if (HEADER_SYNC(val)) {
 		af9035->ssize += to_read;
 		//pr_cont(" S");
-		dump_video = true;
+		if (atomic_read(&af9035->video_stream))
+			dump_video = true;
 		if (!af9035->synced) {
 			af9035->asize = 0;
 			af9035->ssize = 0;
@@ -1112,8 +1122,8 @@ static void demux_one(struct af9035 *af9035,
 		af9035->asize += to_read;
 	} else if (to_read == 180) {
 		//pr_cont(" V");
-		if (af9035->synced && af9035->cur_frame &&
-		    af9035->vsize + to_read < VBUF_SIZE) {
+		if (af9035->synced && atomic_read(&af9035->video_stream) &&
+		    af9035->cur_frame && af9035->vsize + to_read < VBUF_SIZE) {
 			memcpy(af9035->cur_frame + af9035->vsize, pkt->data,
 					to_read);
 			af9035->last_tb = HEADER_TB(val);
@@ -1146,7 +1156,12 @@ static void demux_one(struct af9035 *af9035,
 			vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 			list_del(&buf->list);
 			get_buf_frame(af9035);
+		} else if (af9035->synced && !buf) {
+			dev_dbg_ratelimited(&af9035->intf->dev,
+					    "%s: NO BUF, dropped frame\n",
+					    __func__);
 		}
+
 		//pr_cont("vsize=%u ssize=%u\n", af9035->vsize, af9035->ssize);
 		af9035->vsize = 0;
 		af9035->ssize = 0;
@@ -1494,11 +1509,10 @@ static void af9035_complete(struct af9035 *af9035, const u8 *data, unsigned len)
 
         spin_lock_irqsave(&af9035->buflock, flags);
 
-	get_buf_frame(af9035);
-
-	if (!af9035->cur_buf && af9035->synced)
-		dev_dbg_ratelimited(&af9035->intf->dev, "%s: NO BUF\n",
-				    __func__);
+	if (atomic_read(&af9035->video_stream))
+		get_buf_frame(af9035);
+	else
+		af9035->cur_buf = af9035->cur_frame = NULL;
 
 	af9035_output_to_frame(af9035, data, len);
 
