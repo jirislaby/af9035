@@ -895,6 +895,11 @@ static int af9035_g_input(struct file *file, void *priv, unsigned int *i)
 	return 0;
 }
 
+static int af9035_s_input(struct file *file, void *priv, unsigned int i)
+{
+	return i ? -EINVAL : 0;
+}
+
 static const struct v4l2_ioctl_ops af9035_ioctl_ops = {
 	.vidioc_querycap = af9035_querycap,
 	.vidioc_enum_input = af9035_enum_input,
@@ -905,7 +910,7 @@ static const struct v4l2_ioctl_ops af9035_ioctl_ops = {
 	.vidioc_g_std = af9035_g_std,
 	.vidioc_s_std = af9035_s_std,
 	.vidioc_g_input = af9035_g_input,
-//	.vidioc_s_input = af9035_s_input,
+	.vidioc_s_input = af9035_s_input,
 
 	.vidioc_reqbufs = vb2_ioctl_reqbufs,
 	.vidioc_prepare_buf = vb2_ioctl_prepare_buf,
