@@ -121,6 +121,7 @@ struct af9035 {
 	struct vb2_queue vb2q;
 
 	atomic_t snd_stream;
+	struct work_struct snd_trigger;
 	struct snd_card *snd;
 	struct snd_pcm_substream *snd_substream;
 	size_t snd_buffer_pos;
@@ -1075,6 +1076,51 @@ static void copy_to_local(struct af9035 *af9035, const uint8_t *isoc_data,
 	af9035->packet_buf_ptr += to_copy;
 }
 
+static void write_audio(struct af9035 *chip, const uint8_t *data,
+			unsigned size)
+{
+        struct snd_pcm_substream *substream = chip->snd_substream;
+        struct snd_pcm_runtime *runtime = substream->runtime;
+        size_t frame_bytes, chunk_length, buffer_pos, period_pos;
+        bool period_elapsed = false;
+        unsigned long flags;
+
+	frame_bytes = runtime->frame_bits >> 3;
+	chunk_length = size / frame_bytes;
+	buffer_pos = chip->snd_buffer_pos;
+	period_pos = chip->snd_period_pos;
+
+	if (buffer_pos + chunk_length >= runtime->buffer_size) {
+		size_t cnt = (runtime->buffer_size - buffer_pos) * frame_bytes;
+		memcpy(runtime->dma_area + buffer_pos * frame_bytes, data, cnt);
+		memcpy(runtime->dma_area, data + cnt,
+		       chunk_length * frame_bytes - cnt);
+	} else {
+		memcpy(runtime->dma_area + buffer_pos * frame_bytes,
+		       data, chunk_length * frame_bytes);
+	}
+
+	buffer_pos = (buffer_pos + chunk_length) % runtime->buffer_size;
+	period_pos += chunk_length;
+	if (period_pos >= runtime->period_size) {
+		period_pos -= runtime->period_size;
+		period_elapsed = true;
+	}
+
+	dev_dbg(&chip->intf->dev, "%s: size=%u fr=%zu ch=%zu (sz=%lu) bpos=%zu->%zu ppos=%zu->%zu (sz=%lu) pelps=%u\n",
+		__func__, size, frame_bytes, chunk_length, runtime->buffer_size,
+		chip->snd_buffer_pos, buffer_pos, chip->snd_period_pos,
+		period_pos, runtime->period_size, period_elapsed);
+
+	snd_pcm_stream_lock_irqsave(substream, flags);
+	chip->snd_buffer_pos = buffer_pos;
+	chip->snd_period_pos = period_pos;
+
+	if (period_elapsed)
+		snd_pcm_period_elapsed_under_stream_lock(substream);
+	snd_pcm_stream_unlock_irqrestore(substream, flags);
+}
+
 static void demux_one(struct af9035 *af9035,
 		      const struct af9035_packet *pkt)
 {
@@ -1096,10 +1142,8 @@ static void demux_one(struct af9035 *af9035,
 		af9035->synced = true;
 	} else if (HEADER_AUDIO(val)) {
 		//pr_cont(" A");
-#if 0
-		if (af9035->synced && audio_fd >= 0)
-			write(audio_fd, pkt->data, to_read);
-#endif
+		if (af9035->synced && atomic_read(&af9035->snd_stream))
+			write_audio(af9035, pkt->data, to_read);
 		af9035->asize += to_read;
 	} else if (to_read == 180) {
 		//pr_cont(" V");
@@ -1285,6 +1329,19 @@ static int snd_af9035_prepare(struct snd_pcm_substream *substream)
         return 0;
 }
 
+static void snd_af9035_trigger(struct work_struct *work)
+{
+	struct af9035 *chip = container_of(work, struct af9035, snd_trigger);
+
+	if (!chip->snd)
+		return;
+
+	if (atomic_read(&chip->snd_stream))
+		af9035_start(chip);
+	else
+		af9035_stop(chip);
+}
+
 static int snd_af9035_card_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct af9035 *chip = snd_pcm_substream_chip(substream);
@@ -1294,15 +1351,19 @@ static int snd_af9035_card_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		atomic_set(&chip->snd_stream, 1);
-		return 0;
+		break;
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		atomic_set(&chip->snd_stream, 0);
-		return 0;
+		break;
 	default:
 		return -EINVAL;
 	}
+
+	schedule_work(&chip->snd_trigger);
+
+	return 0;
 }
 
 static snd_pcm_uframes_t snd_af9035_pointer(struct snd_pcm_substream *substream)
@@ -1327,6 +1388,7 @@ static int af9035_audio_init(struct af9035 *af9035)
 	struct snd_pcm *pcm;
 	int ret;
 
+	INIT_WORK(&af9035->snd_trigger, snd_af9035_trigger);
 	atomic_set(&af9035->snd_stream, 0);
 
         ret = snd_card_new(&af9035->intf->dev, SNDRV_DEFAULT_IDX1, "af9035",
@@ -1401,8 +1463,9 @@ static void af9035_complete(struct af9035 *af9035, const u8 *data, unsigned len)
 
 	get_buf_frame(af9035);
 
-	/*if (!af9035->cur_buf)
-		dev_dbg(&af9035->intf->dev, "%s: NO BUF\n", __func__);*/
+	if (!af9035->cur_buf && af9035->synced)
+		dev_dbg_ratelimited(&af9035->intf->dev, "%s: NO BUF\n",
+				    __func__);
 
 	af9035_output_to_frame(af9035, data, len);
 
