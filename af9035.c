@@ -1045,6 +1045,10 @@ static inline unsigned HEADER_SIZE(const uint32_t val)
 static void copy_to_local(struct af9035 *af9035, const uint8_t *isoc_data,
 			  unsigned to_copy)
 {
+	if (WARN_ON_ONCE(af9035->packet_buf_ptr + to_copy >
+			 sizeof(af9035->packet_buf)))
+		to_copy = sizeof(af9035->packet_buf) - af9035->packet_buf_ptr;
+
 	memmove(af9035->packet_buf + af9035->packet_buf_ptr, isoc_data,
 		to_copy);
 	af9035->packet_buf_ptr += to_copy;
@@ -1181,8 +1185,15 @@ static unsigned demux_packet(struct af9035 *af9035,
 	if (af9035->packet_buf_ptr) {
 		bool done = true;
 		pkt = (void *)af9035->packet_buf;
-		to_read = HEADER_SIZE(be32_to_cpu(pkt->val)) + sizeof(*pkt) -
-			af9035->packet_buf_ptr;
+		to_read = HEADER_SIZE(be32_to_cpu(pkt->val));
+		if (to_read > PACKET_SIZE - 4) {
+			dev_dbg(&af9035->intf->dev, "BAD buf_ptr sz=%u val=%.8x\n",
+				to_read, be32_to_cpu(pkt->val));
+			af9035->packet_buf_ptr = 0;
+			return 0;
+		}
+
+		to_read += sizeof(*pkt) - af9035->packet_buf_ptr;
 
 		if (len < to_read) {
 			done = false;
@@ -1204,7 +1215,8 @@ static unsigned demux_packet(struct af9035 *af9035,
 	}
 
 	if (pkt->FA != 0xfa) {
-		//pr_cont(" BAD(%.8x)\n", be32_to_cpu(pkt->val));
+		dev_dbg(&af9035->intf->dev, "BAD FA val=%.8x\n",
+			be32_to_cpu(pkt->val));
 		return 4;
 	}
 
