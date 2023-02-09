@@ -146,7 +146,7 @@ struct af9035 {
 
 	unsigned packet_buf_ptr;
 	u8 packet_buf[PACKET_SIZE];
-	bool synced, last_tb;
+	bool synced, last_tb, previous_tb;
 	unsigned sequence, vsize, asize, ssize;
 	off_t off;
 };
@@ -1148,8 +1148,11 @@ static void demux_one(struct af9035 *af9035,
 			int size = vb2_plane_size(&buf->vb.vb2_buf, 0);
 			//pr_cont("dumping; ");
 
-			dev_dbg(&af9035->intf->dev, "%s: done buf=%p (TB=%u)\n",
-					__func__, buf, af9035->last_tb);
+			if (af9035->previous_tb == af9035->last_tb)
+				dev_dbg(&af9035->intf->dev, "%s: done buf=%p (TB=%u/prev=%u)\n",
+					__func__, buf, af9035->last_tb,
+					af9035->previous_tb);
+			af9035->previous_tb = af9035->last_tb;
 			buf->vb.field = af9035->last_tb ? V4L2_FIELD_TOP :
 				V4L2_FIELD_BOTTOM;
 			buf->vb.sequence = af9035->sequence;
@@ -1215,8 +1218,9 @@ static unsigned demux_packet(struct af9035 *af9035,
 	}
 
 	if (pkt->FA != 0xfa) {
-		dev_dbg(&af9035->intf->dev, "BAD FA val=%.8x\n",
-			be32_to_cpu(pkt->val));
+		if (af9035->synced)
+			dev_dbg(&af9035->intf->dev, "BAD FA val=%.8x\n",
+				be32_to_cpu(pkt->val));
 		return 4;
 	}
 
