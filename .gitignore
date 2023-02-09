@@ -6,3 +6,5 @@
 *.mod.c
 Module.symvers
 modules.order
+
+cscope.out
