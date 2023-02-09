@@ -1085,10 +1085,10 @@ static void write_audio(struct af9035 *chip, const uint8_t *data,
 		period_elapsed = true;
 	}
 
-	dev_dbg(&chip->intf->dev, "%s: size=%u fr=%zu ch=%zu (sz=%lu) bpos=%zu->%zu ppos=%zu->%zu (sz=%lu) pelps=%u\n",
+	/*dev_dbg(&chip->intf->dev, "%s: size=%u fr=%zu ch=%zu (sz=%lu) bpos=%zu->%zu ppos=%zu->%zu (sz=%lu) pelps=%u\n",
 		__func__, size, frame_bytes, chunk_length, runtime->buffer_size,
 		chip->snd_buffer_pos, buffer_pos, chip->snd_period_pos,
-		period_pos, runtime->period_size, period_elapsed);
+		period_pos, runtime->period_size, period_elapsed);*/
 
 	snd_pcm_stream_lock_irqsave(substream, flags);
 	chip->snd_buffer_pos = buffer_pos;
