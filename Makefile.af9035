@@ -1,0 +1,1 @@
+obj-$(CONFIG_VIDEO_AF9035) += af9035.o

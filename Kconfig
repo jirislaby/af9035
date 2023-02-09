@@ -1,0 +1,11 @@
+config VIDEO_AF9035
+	tristate "AF9035 video capture support"
+	depends on VIDEO_DEV && SND
+	select SND_PCM
+	select VIDEOBUF2_VMALLOC
+
+	help
+	  This is a video4linux2 driver for AF9035 based video capture devices.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called af9035
