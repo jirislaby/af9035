@@ -409,15 +409,9 @@ static int af9035_write_blob(struct af9035 *af9035,
 					    blob[i].addr, blob[i].data,
 					    blob[i].len);
 			if (ret) {
-				if (af9035->buf[2] == blob[i].sta) {
-					dev_dbg(&af9035->intf->dev,
-						"%uth blob [%.2x:%.2x] EXPECTEDLY failed\n",
-						i, blob[i].bus, blob[i].addr);
-				} else {
-					dev_err(&af9035->intf->dev,
-						"%uth blob failed\n", i);
-					return ret;
-				}
+				dev_err(&af9035->intf->dev,
+					"%uth blob failed\n", i);
+				return ret;
 			}
 		}
 	}
@@ -1684,7 +1678,6 @@ static int af9035_sleep(struct af9035 *af9035)
 
 static int af9035_frontend_init(struct af9035 *af9035)
 {
-	static const u8 wbuf[4] = { 0x00, 0x08, 0x00, 0x00 };
 	int ret;
 
 	/* I2C master bus 1,3 clock speed 366k */
@@ -1701,17 +1694,6 @@ static int af9035_frontend_init(struct af9035 *af9035)
 				ARRAY_SIZE(af9035_init_blob));
 	if (ret < 0)
 		return ret;
-
-	/* likely unneeded as it (expectedly) fails */
-	ret = af9035_wr_i2c(af9035, 0, 0x02, 0xc2, wbuf, sizeof(wbuf));
-	if (!ret)
-		return -EIO;
-
-	if (af9035->buf[2] == 4)
-		dev_dbg(&af9035->intf->dev,
-				"write to 02:c2 EXPECTEDLY failed\n");
-	else
-		return -EIO;
 
 	return af9035_sleep(af9035);
 }

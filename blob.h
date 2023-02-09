@@ -11,7 +11,6 @@ struct af9035_blob {
 	u8 type;
 	u8 len;
 	u8 data[52];
-	u8 sta;
 };
 
 static const struct af9035_blob af9035_init_blob[] = {
@@ -349,7 +348,6 @@ static const struct af9035_blob af9035_start_blob1[] = {
 	{ .reg = 0x00d8d0, 0, 1, { 0x01 } }, /* TUN_MXL(00d8d0) */
 	{ .reg = 0x00d8cf, 0, 1, { 0x01 } }, /* TUN_MXL(00d8cf) */
 	{ .reg = 0x00f103, 0, 1, { 0x07 } }, /* I2Cm13_CLK_SPD */
-	{ .bus = 0x02, .addr = 0x61, 1, 4, { 0x00, 0x08, 0x00, 0x00 }, 4 },
 	{ .reg = 0x00d8c3, 0, 1, { 0x00 } }, /* TUN_MXL(00d8c3) */
 	{ .bus = 0x01, .addr = 0x41, 1, 4, { 0x25, 0x86, 0x00, 0x60 } },
 	{ .bus = 0x01, .addr = 0x41, 1, 4, { 0x04, 0x00, 0x02, 0x7c } },
@@ -482,7 +480,6 @@ static const struct af9035_blob af9035_start_blob2[] = {
 	{ .reg = 0x80f9bb, 0, 1, { 0x01 } }, /* TUN_IT9135(00f9bb) */
 	{ .reg = 0x80f9bb, 0, 1, { 0x00 } }, /* TUN_IT9135(00f9bb) */
 	{ .reg = 0x00dda9, 0, 1, { 0x00 } }, /* UNK(00dda9) */
-	{ .bus = 0x02, .addr = 0x61, 1, 4, { 0x00, 0x08, 0x00, 0x00 }, 4 },
 	{ .reg = 0x80004c, 0, 1, { 0x01 } }, /* SLEEP(00004c) */
 	{ .reg = 0x800000, 0, 1, { 0x00 } }, /* SLEEP(000000) */
 	{ .reg = 0x80fb24, 0, 1, { 0x08 } }, /* SLEEP(00fb24) */
@@ -690,7 +687,6 @@ static const struct af9035_blob af9035_start_blob2[] = {
 	{ .reg = 0x00d8d0, 0, 1, { 0x01 } }, /* TUN_MXL(00d8d0) */
 	{ .reg = 0x00d8cf, 0, 1, { 0x01 } }, /* TUN_MXL(00d8cf) */
 	{ .reg = 0x00f103, 0, 1, { 0x07 } }, /* I2Cm13_CLK_SPD */
-	{ .bus = 0x02, .addr = 0x61, 1, 4, { 0x00, 0x08, 0x00, 0x00 }, 4 },
 	{ .reg = 0x00d8c3, 0, 1, { 0x00 } }, /* TUN_MXL(00d8c3) */
 	{ .bus = 0x01, .addr = 0x41, 1, 4, { 0x25, 0x86, 0x00, 0x60 } },
 	{ .bus = 0x01, .addr = 0x41, 1, 4, { 0x04, 0x00, 0x02, 0x7c } },
@@ -838,7 +834,6 @@ static const struct af9035_blob af9035_start_blob2[] = {
 	{ .reg = 0x00d8d0, 0, 1, { 0x01 } }, /* TUN_MXL(00d8d0) */
 	{ .reg = 0x00d8cf, 0, 1, { 0x01 } }, /* TUN_MXL(00d8cf) */
 	{ .reg = 0x00f103, 0, 1, { 0x07 } }, /* I2Cm13_CLK_SPD */
-	{ .bus = 0x02, .addr = 0x61, 1, 4, { 0x00, 0x08, 0x00, 0x00 }, 4 },
 	{ .reg = 0x00d8c3, 0, 1, { 0x00 } }, /* TUN_MXL(00d8c3) */
 	{ .bus = 0x01, .addr = 0x41, 1, 4, { 0x25, 0x86, 0x00, 0x60 } },
 	{ .bus = 0x01, .addr = 0x41, 1, 4, { 0x04, 0x00, 0x02, 0x7c } },
