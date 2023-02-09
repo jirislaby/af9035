@@ -6,6 +6,7 @@
  * Copyright (C) 2023 Jiri Slaby
  */
 
+#include <linux/atomic.h>
 #include <linux/delay.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
@@ -20,6 +21,11 @@
 #include <media/v4l2-ioctl.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
+
+#include <sound/core.h>
+#include <sound/initval.h>
+#include <sound/ac97_codec.h>
+#include <sound/pcm_params.h>
 
 #include "blob.h"
 
@@ -71,6 +77,8 @@
 #define STREAM_BUFS_PER_URB	32
 #define STREAM_BUF_SIZE		3072
 
+#define AUDIO_BUFFER		65536
+
 #define PACKET_SIZE		184
 /* half-size (interlacing) of 16bit (UYVY) 720x576 picture */
 #define VBUF_SIZE		(720*576*2/2)
@@ -111,6 +119,12 @@ struct af9035 {
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
 	struct vb2_queue vb2q;
+
+	atomic_t snd_stream;
+	struct snd_card *snd;
+	struct snd_pcm_substream *snd_substream;
+	size_t snd_buffer_pos;
+	size_t snd_period_pos;
 
 	struct mutex vb2q_lock;
 	struct mutex v4l2_lock;
@@ -1219,6 +1233,150 @@ static bool af9035_output_to_frame(struct af9035 *af9035,
 	return false;
 }
 
+/* =========================== ALSA =========================== */
+
+static const struct snd_pcm_hardware snd_af9035_digital_hw = {
+	.info = SNDRV_PCM_INFO_BATCH |
+		SNDRV_PCM_INFO_MMAP |
+		SNDRV_PCM_INFO_INTERLEAVED |
+		SNDRV_PCM_INFO_BLOCK_TRANSFER |
+		SNDRV_PCM_INFO_MMAP_VALID,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE,
+	.rates = SNDRV_PCM_RATE_48000,
+	.rate_min = 48000,
+	.rate_max = 48000,
+	.channels_min = 2,
+	.channels_max = 2,
+	.period_bytes_min = 11059,
+	.period_bytes_max = 13516,
+	.periods_min = 2,
+	.periods_max = 98,
+	.buffer_bytes_max = 62720 * 8, /* value in usbaudio.c */
+};
+
+static int snd_af9035_pcm_open(struct snd_pcm_substream *substream)
+{
+	struct af9035 *chip = snd_pcm_substream_chip(substream);
+	struct snd_pcm_runtime *runtime = substream->runtime;
+
+	chip->snd_substream = substream;
+	runtime->hw = snd_af9035_digital_hw;
+
+	return 0;
+}
+
+static int snd_af9035_pcm_close(struct snd_pcm_substream *substream)
+{
+	struct af9035 *chip = snd_pcm_substream_chip(substream);
+
+	if (atomic_read(&chip->snd_stream))
+		atomic_set(&chip->snd_stream, 0);
+
+	return 0;
+}
+
+static int snd_af9035_prepare(struct snd_pcm_substream *substream)
+{
+        struct af9035 *chip = snd_pcm_substream_chip(substream);
+
+        chip->snd_buffer_pos = 0;
+        chip->snd_period_pos = 0;
+
+        return 0;
+}
+
+static int snd_af9035_card_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct af9035 *chip = snd_pcm_substream_chip(substream);
+
+	switch (cmd) {
+	case SNDRV_PCM_TRIGGER_START:
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		atomic_set(&chip->snd_stream, 1);
+		return 0;
+	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		atomic_set(&chip->snd_stream, 0);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static snd_pcm_uframes_t snd_af9035_pointer(struct snd_pcm_substream *substream)
+{
+	struct af9035 *chip = snd_pcm_substream_chip(substream);
+
+	return chip->snd_buffer_pos;
+}
+
+static const struct snd_pcm_ops snd_af9035_pcm_ops = {
+	.open = snd_af9035_pcm_open,
+	.close = snd_af9035_pcm_close,
+	.prepare = snd_af9035_prepare,
+	.trigger = snd_af9035_card_trigger,
+	.pointer = snd_af9035_pointer,
+};
+
+static int af9035_audio_init(struct af9035 *af9035)
+{
+	struct usb_device *udev = interface_to_usbdev(af9035->intf);
+	struct snd_card *card;
+	struct snd_pcm *pcm;
+	int ret;
+
+	atomic_set(&af9035->snd_stream, 0);
+
+        ret = snd_card_new(&af9035->intf->dev, SNDRV_DEFAULT_IDX1, "af9035",
+			   THIS_MODULE, 0, &card);
+        if (ret < 0)
+                return ret;
+
+	strscpy(card->driver, "af9035", sizeof(card->driver));
+	strscpy(card->shortname, "af9035", sizeof(card->shortname));
+	snprintf(card->longname, sizeof(card->longname),
+		 "AF9035 Audio at bus %d device %d", udev->bus->busnum,
+		 udev->devnum);
+
+	snd_card_set_dev(card, &af9035->intf->dev);
+
+	af9035->snd = card;
+
+	ret = snd_pcm_new(card, "AF9035 Audio", 0, 0, 1, &pcm);
+	if (ret < 0)
+		goto err;
+
+	strscpy(pcm->name, "AF9035 Audio Input", sizeof(pcm->name));
+	pcm->info_flags = 0;
+	pcm->private_data = af9035;
+
+	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_CAPTURE, &snd_af9035_pcm_ops);
+	snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_CONTINUOUS,
+				       NULL, AUDIO_BUFFER, AUDIO_BUFFER);
+
+	ret = snd_card_register(card);
+	if (ret)
+		goto err;
+
+	return 0;
+
+err:
+	af9035->snd = NULL;
+	snd_card_free(card);
+
+	return ret;
+}
+
+static void af9035_audio_free(struct af9035 *af9035)
+{
+	if (af9035->snd && af9035->intf) {
+		snd_card_free_when_closed(af9035->snd);
+		af9035->snd = NULL;
+	}
+}
+
 /* =========================== DEV =========================== */
 
 static void get_buf_frame(struct af9035 *af9035)
@@ -1251,7 +1409,7 @@ static void af9035_complete(struct af9035 *af9035, const u8 *data, unsigned len)
         spin_unlock_irqrestore(&af9035->buflock, flags);
 }
 
-static void usb_urb_complete(struct urb *urb)
+static void af9035_urb_complete(struct urb *urb)
 {
         struct af9035 *af9035 = urb->context;
 	int ret;
@@ -1365,7 +1523,7 @@ static int af9035_stream_init(struct af9035 *af9035)
 
 		urb->dev = udev;
 		urb->context = af9035;
-		urb->complete = usb_urb_complete;
+		urb->complete = af9035_urb_complete;
 		urb->pipe = usb_rcvisocpipe(udev, 0x6);
 		urb->transfer_flags = URB_ISO_ASAP;
 		urb->interval = 1;
@@ -1542,10 +1700,17 @@ static int af9035_probe(struct usb_interface *intf,
 	if (ret)
 		goto err_dev;
 
-	usb_set_intfdata(intf, af9035);
 	v4l2_device_get(&af9035->v4l2_dev);
 
+	ret = af9035_audio_init(af9035);
+	if (ret)
+		goto err_video;
+
+	usb_set_intfdata(intf, af9035);
+
 	return 0;
+err_video:
+	af9035_video_free(af9035);
 err_dev:
 	af9035_dev_exit(af9035);
 err_free:
@@ -1563,6 +1728,7 @@ static void af9035_disconnect(struct usb_interface *intf)
 	dev_info(&intf->dev, "%s: %zu\n", __func__,
 		 intf->cur_altsetting - intf->altsetting);
 
+	af9035_audio_free(af9035);
 	af9035_video_free(af9035);
 
 	af9035->intf = NULL;
