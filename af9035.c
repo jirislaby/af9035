@@ -115,6 +115,7 @@ struct af9035 {
 	u8 eeprom[256];
 
 	struct usb_interface *intf;
+	unsigned running;
 
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
@@ -130,6 +131,7 @@ struct af9035 {
 	struct mutex vb2q_lock;
 	struct mutex v4l2_lock;
 	struct mutex usb_lock;
+	struct mutex start_lock;
 
 	void *stream_bufs[STREAM_BUFS];
 	struct urb *urbs[STREAM_BUFS];
@@ -148,6 +150,8 @@ struct af9035 {
 	off_t off;
 };
 
+static int af9035_start(struct af9035 *af9035);
+static void af9035_stop(struct af9035 *af9035);
 static int af9035_sleep(struct af9035 *af9035);
 static void get_buf_frame(struct af9035 *af9035);
 
@@ -770,45 +774,10 @@ static int af9035_start_streaming(struct vb2_queue *vq, unsigned int count)
 	struct af9035 *af9035 = vb2_get_drv_priv(vq);
 	int ret;
 
-	af9035->packet_buf_ptr = 0;
-	af9035->synced = false;
-	af9035->sequence = 0;
-	af9035->vsize = 0;
-	af9035->asize = 0;
-	af9035->ssize = 0;
-	af9035->off = 0;
+	ret = af9035_start(af9035);
+	if (ret)
+		af9035_reclaim_buffers(af9035, VB2_BUF_STATE_QUEUED);
 
-	if (af9035->intf == NULL) {
-		ret = -ENODEV;
-		goto err;
-	}
-
-	ret = af9035_write_blob(af9035, af9035_start_blob1,
-				ARRAY_SIZE(af9035_start_blob1));
-	if (ret) {
-		dev_err(&af9035->intf->dev, "%s: 1st blob failed\n", __func__);
-		goto err;
-	}
-
-	ret = af9035_submit_urbs(af9035);
-	if (ret) {
-		dev_err(&af9035->intf->dev, "%s: submit urbs failed\n",
-			__func__);
-		goto err;
-	}
-
-	ret = af9035_write_blob(af9035, af9035_start_blob2,
-				ARRAY_SIZE(af9035_start_blob2));
-	if (ret) {
-		dev_err(&af9035->intf->dev, "%s: 2nd blob failed\n", __func__);
-		goto err_urbs;
-	}
-
-	return 0;
-err_urbs:
-	af9035_kill_urbs(af9035);
-err:
-	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_QUEUED);
 	return ret;
 }
 
@@ -816,11 +785,7 @@ static void af9035_stop_streaming(struct vb2_queue *vq)
 {
 	struct af9035 *af9035 = vb2_get_drv_priv(vq);
 
-	if (af9035->intf) {
-		af9035_sleep(af9035);
-		af9035_kill_urbs(af9035);
-	}
-
+	af9035_stop(af9035);
 	af9035_reclaim_buffers(af9035, VB2_BUF_STATE_ERROR);
 }
 
@@ -1002,7 +967,7 @@ static void af9035_video_free(struct af9035 *af9035)
 	mutex_lock(&af9035->vb2q_lock);
 	mutex_lock(&af9035->v4l2_lock);
 
-	//af9035_stop(af9035);
+	af9035_stop(af9035);
 	vb2_video_unregister_device(&af9035->vdev);
 	v4l2_device_disconnect(&af9035->v4l2_dev);
 
@@ -1441,6 +1406,74 @@ static void af9035_audio_free(struct af9035 *af9035)
 
 /* =========================== DEV =========================== */
 
+static int af9035_start(struct af9035 *af9035)
+{
+	int ret;
+
+	mutex_lock(&af9035->start_lock);
+	if (af9035->running++) {
+		mutex_unlock(&af9035->start_lock);
+		return 0;
+	}
+
+	dev_dbg(&af9035->intf->dev, "%s\n", __func__);
+
+	af9035->packet_buf_ptr = 0;
+	af9035->synced = false;
+	af9035->sequence = 0;
+	af9035->vsize = 0;
+	af9035->asize = 0;
+	af9035->ssize = 0;
+	af9035->off = 0;
+
+	if (af9035->intf == NULL) {
+		ret = -ENODEV;
+		goto err;
+	}
+
+	ret = af9035_write_blob(af9035, af9035_start_blob1,
+				ARRAY_SIZE(af9035_start_blob1));
+	if (ret) {
+		dev_err(&af9035->intf->dev, "%s: 1st blob failed\n", __func__);
+		goto err;
+	}
+
+	ret = af9035_submit_urbs(af9035);
+	if (ret) {
+		dev_err(&af9035->intf->dev, "%s: submit urbs failed\n",
+			__func__);
+		goto err;
+	}
+
+	ret = af9035_write_blob(af9035, af9035_start_blob2,
+				ARRAY_SIZE(af9035_start_blob2));
+	if (ret) {
+		dev_err(&af9035->intf->dev, "%s: 2nd blob failed\n", __func__);
+		goto err_urbs;
+	}
+
+	mutex_unlock(&af9035->start_lock);
+
+	return 0;
+err_urbs:
+	af9035_kill_urbs(af9035);
+err:
+	af9035->running--;
+	mutex_unlock(&af9035->start_lock);
+	return ret;
+}
+
+static void af9035_stop(struct af9035 *af9035)
+{
+	mutex_lock(&af9035->start_lock);
+	if (af9035->intf && !--af9035->running) {
+		dev_dbg(&af9035->intf->dev, "%s\n", __func__);
+		af9035_sleep(af9035);
+		af9035_kill_urbs(af9035);
+	}
+	mutex_unlock(&af9035->start_lock);
+}
+
 static void get_buf_frame(struct af9035 *af9035)
 {
 	if (list_empty(&af9035->bufs)) {
@@ -1750,6 +1783,7 @@ static int af9035_probe(struct usb_interface *intf,
 	mutex_init(&af9035->vb2q_lock);
 	mutex_init(&af9035->v4l2_lock);
 	mutex_init(&af9035->usb_lock);
+	mutex_init(&af9035->start_lock);
 	spin_lock_init(&af9035->buflock);
 	INIT_LIST_HEAD(&af9035->bufs);
 
